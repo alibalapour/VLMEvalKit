@@ -2615,7 +2615,12 @@ interns1_series = {}
 for group in interns1_groups:
     interns1_series.update(group)
     
-supported_VLM = {}
+supported_VLM = 
+
+{
+'MedGemma-1.5-4B': partial(MedGemma, model_path='google/medgemma-1.5-4b-it'),
+}
+
 
 model_groups = [
     ungrouped, o1_apis, api_models, xtuner_series, qwen_series, llava_series, granite_vision_series,

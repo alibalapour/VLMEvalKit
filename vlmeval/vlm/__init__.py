@@ -2,6 +2,10 @@ import torch
 
 torch.set_grad_enabled(False)
 torch.manual_seed(1234)
+
+# Added models
+from .medgemma import MedGemma
+
 from .aki import AKI
 from .aria import Aria
 from .bagel_umm import Bagel
