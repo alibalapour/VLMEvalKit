@@ -5,6 +5,9 @@ import warnings
 import numpy as np
 import pandas as pd
 
+# Added Datasets
+from .sonoreason import SonoReasonDD
+
 from vlmeval.smp import LMUDataRoot, dump, get_intermediate_file_path, load, localize_df, toliststr
 from .asclepius import Asclepius
 from .av_speakerbench import AVSpeakerBench
@@ -273,7 +276,7 @@ class ConcatDataset(ImageBaseDataset):
 
 
 # Add new supported dataset class here
-IMAGE_DATASET = [
+IMAGE_DATASET = [ SonoReasonDD,
     ImageCaptionDataset, ImageYORNDataset, ImageMCQDataset, ImageVQADataset,
     MathVision, LENS, MMMUDataset, OCRBench, MathVista, LLaVABench, LLaVABench_KO, VGRPBench, MMVet,  # noqa: E501
     MTVQADataset, TableVQABench, MMLongBench, VCRDataset, MMDUDataset, DUDE,
