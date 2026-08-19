@@ -1,6 +1,10 @@
-import os, re, pandas as pd
+import os
+
+import pandas as pd
+
 from .image_base import ImageBaseDataset
 from ..smp import load, dump
+
 
 class SonoReasonDD(ImageBaseDataset):
     TYPE = 'VQA'
@@ -8,10 +12,25 @@ class SonoReasonDD(ImageBaseDataset):
     DATASET_MD5 = {'sonoreason_dd_breast': ''}
 
     def load_data(self, dataset):
-        import os, pandas as pd
         data_root = os.environ.get('LMUData', os.path.expanduser('~/LMUData'))
-        path = os.path.join(data_root, f'{dataset}.tsv')
-        return pd.read_csv(path, sep='\t')
+        relative_path = os.environ.get('SONOREASON_DATASET_FILE', f'{dataset}.tsv')
+        path = os.path.join(data_root, relative_path)
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f'SonoReason dataset file not found: {path}. '
+                'Set LMUData to the dataset root and SONOREASON_DATASET_FILE '
+                'to the relative TSV path.'
+            )
+
+        data = pd.read_csv(path, sep='\t')
+        # Map the published SonoReason schema to VLMEvalKit's canonical fields.
+        data = data.rename(columns={
+            'img_data': 'image',
+            'direct_prompt': 'question',
+            'class_label': 'answer',
+        })
+        data['index'] = range(len(data))
+        return data
 
     def build_prompt(self, line):
         if isinstance(line, int):
