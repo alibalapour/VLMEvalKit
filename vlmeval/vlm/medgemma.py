@@ -1,6 +1,37 @@
+import os
+
 import torch
 from PIL import Image
 from .base import BaseModel
+from .sonoreason_gen import default_gen_kwargs
+
+# Gemma's thought-channel delimiters, as used by MedGemma-1.5. Both are
+# registered with special=False in tokenizer_config.json, so decoding with
+# skip_special_tokens=True does NOT remove them -- they land verbatim in the
+# prediction string (see strip_thinking() in dataset/sonoreason.py).
+THINK_OPEN_TOKEN = '<unused94>'
+THINK_CLOSE_TOKEN = '<unused95>'
+
+# Default prefill appended to the model turn to suppress the thought channel.
+# Empty string disables suppression.
+#
+# Why this exists -- measured on run 55013062 (structured arm, 2026-08-16):
+# MedGemma-1.5 opens the thought channel whenever the prompt asks for explicit
+# multi-step work. The structured prompt's STAGE 1/2/3 cascade triggers it on
+# 100% of rows (460/460 on dd_breast, 470/470 on busbra_birads), and the trace
+# runs ~5.2k chars -- the entire max_new_tokens=1600 budget. Consequences:
+#   * 0/460 rows ever reached decision.label or <answer>; the run would have
+#     scored 100% parse failure even with unlimited wall clock;
+#   * stop_strings=['</answer>'] could never fire, so every row ran to the token
+#     cap: 45.9 s/it, ~24h projected against a 6h limit -> killed at 25%.
+# The reasoning arm on the same model/adapter never opened the channel (0/1875)
+# and parsed at 99.9%, so this is a structured-prompt-specific regression, not a
+# standing property of the model.
+#
+# The chat template exposes no thinking toggle (no enable_thinking kwarg), so
+# the only lever is prefilling the model turn with the closing delimiter.
+DEFAULT_THINK_PREFILL = THINK_CLOSE_TOKEN
+
 
 class MedGemma(BaseModel):
     INSTALL_REQ = False
@@ -12,8 +43,33 @@ class MedGemma(BaseModel):
         self.model = AutoModelForImageTextToText.from_pretrained(
             model_path, torch_dtype=torch.bfloat16,
             device_map='auto', low_cpu_mem_usage=True).eval()
-        self.gen_kwargs = dict(max_new_tokens=512, do_sample=False)
-        self.gen_kwargs.update(kwargs)
+        # See sonoreason_gen.py: the previous no_repeat_ngram_size=3 made the
+        # <answer>/</answer> tags unemittable, which is what produced the ~88%
+        # parse-failure rate on every reasoning run.
+        self.gen_kwargs = default_gen_kwargs(tokenizer=self.processor.tokenizer, **kwargs)
+        self.think_prefill_ids = self._resolve_think_prefill()
+
+    def _resolve_think_prefill(self):
+        """Token ids to append after the generation prompt, or [] to disable.
+
+        Overridable per-run with SONOREASON_THINK_PREFILL so the suppression
+        itself stays ablatable without a code edit:
+          unset            -> '<unused95>' (suppress thinking)
+          ''               -> disabled, model thinks freely
+          any other string -> tokenized and used verbatim
+        """
+        raw = os.environ.get('SONOREASON_THINK_PREFILL')
+        prefill = DEFAULT_THINK_PREFILL if raw is None else raw
+        if not prefill:
+            return []
+        ids = self.processor.tokenizer(
+            prefill, add_special_tokens=False)['input_ids']
+        # A model whose vocabulary lacks these tokens (e.g. plain MedGemma-4B,
+        # which is not a thinking model) tokenizes them into unrelated pieces;
+        # only apply the prefill when it round-trips exactly.
+        if self.processor.tokenizer.decode(ids) != prefill:
+            return []
+        return ids
 
     def generate_inner(self, message, dataset=None):
         content = []
@@ -28,6 +84,18 @@ class MedGemma(BaseModel):
             messages, add_generation_prompt=True, tokenize=True,
             return_dict=True, return_tensors='pt'
         ).to(self.model.device, dtype=torch.bfloat16)
+
+        if self.think_prefill_ids:
+            ids = inputs['input_ids']
+            pre = torch.tensor([self.think_prefill_ids],
+                               device=ids.device, dtype=ids.dtype)
+            inputs['input_ids'] = torch.cat([ids, pre], dim=-1)
+            if 'attention_mask' in inputs:
+                inputs['attention_mask'] = torch.cat(
+                    [inputs['attention_mask'], torch.ones_like(pre)], dim=-1)
+
+        # Computed after the prefill so the slice below drops it: the prefill is
+        # scaffolding we supplied, not something the model produced.
         in_len = inputs['input_ids'].shape[-1]
         with torch.inference_mode():
             out = self.model.generate(**inputs, **self.gen_kwargs)

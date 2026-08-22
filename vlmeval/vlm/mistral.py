@@ -1,6 +1,7 @@
 import torch
 from PIL import Image
 from .base import BaseModel
+from .sonoreason_gen import default_gen_kwargs
 
 class MistralSmall(BaseModel):
     INSTALL_REQ = False
@@ -12,8 +13,9 @@ class MistralSmall(BaseModel):
         self.model = AutoModelForImageTextToText.from_pretrained(
             model_path, torch_dtype=torch.bfloat16,
             device_map='auto', low_cpu_mem_usage=True).eval()
-        self.gen_kwargs = dict(max_new_tokens=512, do_sample=False)
-        self.gen_kwargs.update(kwargs)
+        # See sonoreason_gen.py -- same tag-banning pathology as the other two
+        # adapters, milder here only because this model formats more reliably.
+        self.gen_kwargs = default_gen_kwargs(tokenizer=self.processor.tokenizer, **kwargs)
 
     def generate_inner(self, message, dataset=None):
         content = []
