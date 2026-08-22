@@ -1,4 +1,12 @@
-import os, re, pandas as pd
+import ast
+import json
+import os
+import re
+from pathlib import Path
+
+import pandas as pd
+from json_repair import loads as load_json_repair
+
 from .image_base import ImageBaseDataset
 from .sonoreason_prompts import resolve_prompt_template, build_prompt_variants
 from ..smp import get_logger, load, dump
@@ -80,6 +88,26 @@ def strip_thinking(s):
         return ''
     return s[end + len(THINK_CLOSE):]
 
+# Two strategy vocabularies are in use: the ablation-grid names in
+# experiments/configs (zero_shot / reasoning / structured) and the names added
+# alongside the feature arm (direct_diagnosis / reasoning_diagnosis /
+# feature_diagnosis). Both are accepted and normalized here so neither set of
+# configs breaks on the other's code. Collapse to one vocabulary before
+# publication -- this map is a merge bridge, not a design.
+STRATEGY_ALIASES = {
+    'direct_diagnosis': 'zero_shot',
+    'reasoning_diagnosis': 'reasoning',
+    'feature_diagnosis': 'feature',
+}
+
+
+def canonical_strategy(value=None):
+    """Normalize a prompt-strategy name, defaulting to the env var."""
+    if value is None:
+        value = os.environ.get('SONOREASON_PROMPT_STRATEGY', 'zero_shot')
+    return STRATEGY_ALIASES.get(value, value)
+
+
 # A run above this parse-failure rate is a formatting/decoding fault, not a
 # model result -- the scores it produces are not comparable to a clean run.
 # evaluate() logs a loud warning rather than raising, so a sweep still
@@ -128,8 +156,7 @@ def extract_prediction(pred, valid_labels, strategy=None):
     SONOREASON_PROMPT_STRATEGY so in-run evaluation needs no plumbing, and can
     be passed explicitly when re-scoring an old result file offline.
     """
-    if strategy is None:
-        strategy = os.environ.get('SONOREASON_PROMPT_STRATEGY', 'zero_shot')
+    strategy = canonical_strategy(strategy)
     s = strip_thinking(str(pred).lower())
     match = ANSWER_TAG_RE.search(s)
     if match:
@@ -187,6 +214,101 @@ def extract_prediction(pred, valid_labels, strategy=None):
     return None
 
 
+
+FEATURE_SPECS = {
+    'shape': {
+        'heading': 'SHAPE', 'label': 'lesion_shape_label',
+        'measurements': {
+            'long_axis': 'long_axis_pixels', 'short_axis': 'short_axis_pixels',
+            'axis_difference_percent': 'long_short_difference_percent'},
+        'thresholds': {'oval_threshold_percent': 'shape_oval_threshold_percent'},
+    },
+    'orientation': {
+        'heading': 'ORIENTATION', 'label': 'lesion_orientation_label',
+        'measurements': {'orientation_degrees': 'orientation_degrees'},
+        'thresholds': {'parallel_threshold_degrees': 'orientation_parallel_threshold_degrees'},
+    },
+    'margin': {
+        'heading': 'MARGIN', 'label': 'lesion_margin_label',
+        'measurements': {
+            'short_axis': 'short_axis_pixels',
+            'boundary_contrast_proxy': 'margin_boundary_contrast',
+            'local_noise_estimate': 'margin_local_noise_estimate',
+            'contrast_to_noise_proxy': 'margin_contrast_to_noise'},
+        'thresholds': {'circumscribed_threshold': 'margin_circumscribed_threshold'},
+    },
+    'border': {
+        'heading': 'BORDER MORPHOLOGY', 'label': 'lesion_border_label',
+        'measurements': {
+            'solidity_proxy': 'border_solidity',
+            'perimeter_to_hull_ratio_proxy': 'border_perimeter_to_hull_ratio'},
+        'thresholds': {
+            'smooth_solidity_threshold': 'border_smooth_solidity_threshold',
+            'smooth_perimeter_ratio_threshold': 'border_smooth_perimeter_ratio_threshold',
+            'spiky_perimeter_ratio_threshold': 'border_spiky_perimeter_ratio_threshold'},
+    },
+    'echo_pattern': {
+        'heading': 'ECHO PATTERN', 'label': 'lesion_echo_pattern_label',
+        'measurements': {
+            'short_axis': 'short_axis_pixels',
+            'lesion_core_median': 'echo_lesion_median',
+            'echo_reference_median': 'echo_reference_median',
+            'lesion_to_reference_ratio_proxy': 'echo_lesion_to_reference_ratio',
+            'lesion_iqr': 'echotexture_lesion_iqr'},
+        'thresholds': {
+            'anechoic_ratio_threshold': 'echo_anechoic_ratio_threshold',
+            'anechoic_iqr_threshold': 'echo_anechoic_iqr_threshold',
+            'hypoechoic_ratio_threshold': 'echo_hypoechoic_ratio_threshold',
+            'hyperechoic_ratio_threshold': 'echo_hyperechoic_ratio_threshold'},
+    },
+    'echotexture': {
+        'heading': 'ECHOTEXTURE', 'label': 'lesion_echotexture_label',
+        'measurements': {
+            'lesion_iqr': 'echotexture_lesion_iqr',
+            'echo_reference_median': 'echo_reference_median',
+            'lesion_iqr_to_reference_ratio_proxy': 'echotexture_lesion_iqr_to_reference_ratio'},
+        'thresholds': {
+            'heterogeneous_iqr_ratio_threshold': 'echotexture_heterogeneous_iqr_ratio_threshold'},
+    },
+    'posterior_feature': {
+        'heading': 'POSTERIOR FEATURE', 'label': 'lesion_posterior_feature_label',
+        'measurements': {
+            'posterior_to_reference_ratio_proxy': 'posterior_to_reference_ratio',
+            'shadowing_fraction': 'posterior_shadowing_fraction',
+            'enhancement_fraction': 'posterior_enhancement_fraction'},
+        'thresholds': {
+            'posterior_shadowing_threshold': 'posterior_shadowing_threshold',
+            'posterior_enhancement_threshold': 'posterior_enhancement_threshold',
+            'posterior_combined_min_fraction': 'posterior_combined_min_fraction',
+            'posterior_combined_min_run_columns': 'posterior_combined_min_run_columns'},
+    },
+}
+
+
+def _load_feature_prompts(path):
+    text = Path(path).read_text()
+    pattern = re.compile(
+        r'^=+\n\d+\.\s+(.+?) PROMPT\n=+\n\n(.*?)(?=^=+\n\d+\.|\Z)',
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    by_heading = {heading.strip(): prompt.strip() for heading, prompt in pattern.findall(text)}
+    prompts = {}
+    for feature, spec in FEATURE_SPECS.items():
+        heading = spec['heading']
+        if heading not in by_heading:
+            raise ValueError(f'Missing {heading!r} section in breast feature prompt file: {path}')
+        prompts[feature] = by_heading[heading]
+    return prompts
+
+
+def _json_scalar(value):
+    if pd.isna(value):
+        return None
+    if hasattr(value, 'item'):
+        value = value.item()
+    return value
+
+
 class SonoReasonDD(ImageBaseDataset):
     TYPE = 'VQA'
     # local TSVs in LMUData -- no MD5/URL since these aren't hosted the way
@@ -204,12 +326,114 @@ class SonoReasonDD(ImageBaseDataset):
     DATASET_MD5 = {k: '' for k in DATASET_URL}
 
     _prompt_logged = False  # log the resolved prompt text once per run, not per-row
+    # Canonical strategy -> TSV column carrying the pre-baked prompt. Only
+    # consulted for datasets with no template registered above; build_prompt
+    # prefers the registry (see the BI-RADS note there).
+    PROMPT_COLUMNS = {
+        'zero_shot': 'direct_prompt',
+        'reasoning': 'reasoning_prompt',
+    }
+
+    def _build_feature_data(self, data):
+        prompt_file = os.environ.get('SONOREASON_FEATURE_PROMPTS_FILE')
+        if not prompt_file:
+            raise ValueError(
+                'feature_diagnosis requires SONOREASON_FEATURE_PROMPTS_FILE')
+        prompts = _load_feature_prompts(prompt_file)
+
+        required = {'img_data', 'anatomy_location', 'bbox'}
+        for spec in FEATURE_SPECS.values():
+            required.add(spec['label'])
+            required.update(spec['measurements'].values())
+            required.update(spec['thresholds'].values())
+        missing = required - set(data.columns)
+        if missing:
+            raise ValueError(
+                f'SonoReason TSV is missing feature-diagnosis columns: {sorted(missing)}')
+
+        data = data[
+            data['anatomy_location'].astype(str).str.lower().eq('breast')
+        ].reset_index(drop=True)
+        rows = []
+        for source_index, source in data.iterrows():
+            primary_image_index = f'{source_index}__shape'
+            for feature, spec in FEATURE_SPECS.items():
+                label = _json_scalar(source[spec['label']])
+                if label is None:
+                    continue
+                measurements = {
+                    target: _json_scalar(source[column])
+                    for target, column in spec['measurements'].items()
+                    if _json_scalar(source[column]) is not None
+                }
+                if feature == 'posterior_feature':
+                    try:
+                        _, _, width, height = ast.literal_eval(str(source['bbox']))
+                        measurements['bounding_box_width'] = _json_scalar(width)
+                        measurements['bounding_box_height'] = _json_scalar(height)
+                    except (TypeError, ValueError, SyntaxError):
+                        pass
+                thresholds = {
+                    target: _json_scalar(source[column])
+                    for target, column in spec['thresholds'].items()
+                    if _json_scalar(source[column]) is not None
+                }
+                rows.append({
+                    'index': f'{source_index}__{feature}',
+                    'source_index': source_index,
+                    'patient_id': _json_scalar(source.get('patient_id')),
+                    'dataset_name': _json_scalar(source.get('dataset_name')),
+                    'anatomy_location': 'breast',
+                    'feature': feature,
+                    # Store base64 once per source image. Other feature rows use
+                    # VLMEvalKit's short-index image reference mechanism.
+                    'image': (
+                        source['img_data'] if feature == 'shape' else primary_image_index),
+                    'question': prompts[feature],
+                    'answer': str(label),
+                    'ground_truth_measurements': json.dumps(measurements),
+                    'ground_truth_thresholds': json.dumps(thresholds),
+                })
+        if not rows:
+            raise ValueError('No labeled breast rows are available for feature_diagnosis')
+        return pd.DataFrame(rows)
 
     def load_data(self, dataset):
-        import os, pandas as pd
         data_root = os.environ.get('LMUData', os.path.expanduser('~/LMUData'))
-        path = os.path.join(data_root, f'{dataset}.tsv')
+        relative_path = os.environ.get('SONOREASON_DATASET_FILE', f'{dataset}.tsv')
+        path = os.path.join(data_root, relative_path)
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f'SonoReason dataset file not found: {path}. '
+                'Set LMUData to the dataset root and SONOREASON_DATASET_FILE '
+                'to the relative TSV path.'
+            )
+
+        strategy = canonical_strategy()
         df = pd.read_csv(path, sep='\t')
+        if strategy == 'feature':
+            return self._build_feature_data(df)
+
+        # Two TSV shapes are in play: the published SonoReason schema read
+        # straight from u2_ext_data/data/DD/ (img_data/direct_prompt/class_label),
+        # and the pre-built canonical TSVs under $LMUData. Reading the source
+        # directly is preferred -- it keeps the mask-derived measurement and
+        # lesion_*_label columns the structured/feature arms score against,
+        # which the pre-built files drop -- but both are accepted so existing
+        # $LMUData files keep working.
+        if 'image' not in df.columns:
+            prompt_column = self.PROMPT_COLUMNS.get(strategy, 'direct_prompt')
+            required_columns = {'img_data', prompt_column, 'class_label'}
+            missing_columns = required_columns - set(df.columns)
+            if missing_columns:
+                raise ValueError(
+                    f'SonoReason TSV is missing required columns: {sorted(missing_columns)}')
+            df = df.rename(columns={
+                'img_data': 'image',
+                prompt_column: 'question',
+                'class_label': 'answer',
+            })
+            df['index'] = range(len(df))
 
         # SONOREASON_LIMIT=<n> cuts the run down to a smoke test: enough rows to
         # tell whether the output format parses at all, cheap enough to turn
@@ -248,7 +472,14 @@ class SonoReasonDD(ImageBaseDataset):
         else:
             msgs.append(dict(type='image', value=tgt))
 
-        prompt_strategy = os.environ.get('SONOREASON_PROMPT_STRATEGY', 'zero_shot')
+        # The feature arm builds a distinct per-feature prompt per row in
+        # load_data. sonoreason_dd_breast has a template registered below, so
+        # without this guard the registry would overwrite all seven of them.
+        if 'feature' in line.index:
+            msgs.append(dict(type='text', value=line['question']))
+            return msgs
+
+        prompt_strategy = canonical_strategy()
         meta = DATASET_PROMPT_METADATA.get(self.dataset_name)
         if meta is not None:
             # Both arms are built from the same template so the two conditions
@@ -289,11 +520,102 @@ class SonoReasonDD(ImageBaseDataset):
         msgs.append(dict(type='text', value=text))
         return msgs
 
+    @staticmethod
+    def _normalize_label(value):
+        return str(value).strip().lower().replace('-', '_').replace(' ', '_')
+
+    @staticmethod
+    def _parse_feature_prediction(value):
+        try:
+            parsed = load_json_repair(str(value))
+        except Exception:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    def _evaluate_features(self, data, eval_file):
+        parsed_labels = []
+        parse_ok = []
+        hits = []
+        row_maes = []
+        row_measurement_counts = []
+        measurement_records = []
+
+        for _, row in data.iterrows():
+            parsed = self._parse_feature_prediction(row['prediction'])
+            valid = parsed is not None
+            predicted_label = parsed.get('label') if valid else None
+            parsed_labels.append(predicted_label)
+            parse_ok.append(valid)
+            hits.append(
+                valid
+                and self._normalize_label(predicted_label)
+                == self._normalize_label(row['answer'])
+            )
+
+            truth = json.loads(row['ground_truth_measurements'])
+            predicted_measurements = parsed.get('measurements', {}) if valid else {}
+            if not isinstance(predicted_measurements, dict):
+                predicted_measurements = {}
+            errors = []
+            for measurement, target in truth.items():
+                predicted = predicted_measurements.get(measurement)
+                try:
+                    error = abs(float(predicted) - float(target))
+                except (TypeError, ValueError):
+                    continue
+                errors.append(error)
+                measurement_records.append({
+                    'feature': row['feature'],
+                    'measurement': measurement,
+                    'absolute_error': error,
+                })
+            row_maes.append(sum(errors) / len(errors) if errors else None)
+            row_measurement_counts.append(len(errors))
+
+        data['predicted_label'] = parsed_labels
+        data['prediction_parse_ok'] = parse_ok
+        data['hit'] = hits
+        data['measurement_mae'] = row_maes
+        data['measurement_n'] = row_measurement_counts
+        dump(data, eval_file.replace('.xlsx', '_parsed.xlsx'))
+
+        details = pd.DataFrame(measurement_records)
+        metric_rows = []
+        for feature, group in data.groupby('feature', sort=False):
+            feature_errors = details[details['feature'] == feature] if len(details) else details
+            metric_rows.append({
+                'feature': feature,
+                'label_accuracy': group['hit'].mean(),
+                'json_parse_rate': group['prediction_parse_ok'].mean(),
+                'measurement_mae': (
+                    feature_errors['absolute_error'].mean() if len(feature_errors) else None),
+                'measurement_n': len(feature_errors),
+                'n': len(group),
+            })
+        metric_rows.append({
+            'feature': 'overall',
+            'label_accuracy': data['hit'].mean(),
+            'json_parse_rate': data['prediction_parse_ok'].mean(),
+            'measurement_mae': details['absolute_error'].mean() if len(details) else None,
+            'measurement_n': len(details),
+            'n': len(data),
+        })
+        metrics = pd.DataFrame(metric_rows)
+        dump(metrics, eval_file.replace('.xlsx', '_acc.csv'))
+        if len(details):
+            measurement_metrics = details.groupby(
+                ['feature', 'measurement'], as_index=False)['absolute_error'].agg(['mean', 'count'])
+            dump(measurement_metrics, eval_file.replace('.xlsx', '_measurement_mae.csv'))
+        return metrics
+
     def evaluate(self, eval_file, **kwargs):
+        data = load(eval_file)
+        if 'feature' in data.columns:
+            return self._evaluate_features(data, eval_file)
+
         from sklearn.metrics import (confusion_matrix, precision_recall_fscore_support,
                                      balanced_accuracy_score)
 
-        data = load(eval_file)
         valid_labels = sorted(set(str(a).lower().strip() for a in data['answer'].unique()))
         data['norm_answer'] = data['answer'].apply(lambda x: norm_label(x, valid_labels))
         data['norm_pred'] = data['prediction'].apply(lambda x: extract_prediction(x, valid_labels))
