@@ -2619,6 +2619,7 @@ supported_VLM = {
 'MedGemma-4B': partial(vlm.MedGemma, model_path='google/medgemma-4b-it'),
 'MedGemma-1.5-4B': partial(vlm.MedGemma, model_path='google/medgemma-1.5-4b-it'),
 'Mistral-Small-3.1-24B-Instruct-2503': partial(vlm.MistralSmall, model_path='mistralai/Mistral-Small-3.1-24B-Instruct-2503'),
+'LLaVA-Med-v1.5-Mistral-7B': partial(vlm.LLaVAMed, model_path='chaoyinshe/llava-med-v1.5-mistral-7b-hf'),
 
 }
 
