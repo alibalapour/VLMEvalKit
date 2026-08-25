@@ -2,10 +2,13 @@ import ast
 import json
 import os
 import re
+from functools import lru_cache
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from json_repair import loads as load_json_repair
+from PIL import Image
 
 from .image_base import ImageBaseDataset
 from .sonoreason_prompts import resolve_prompt_template, build_prompt_variants
@@ -334,6 +337,62 @@ class SonoReasonDD(ImageBaseDataset):
         'reasoning': 'reasoning_prompt',
     }
 
+    def _build_segmentation_data(self, data):
+        required = {
+            'img_data', 'mask', 'segmentation_bbox_xyxy',
+            'image_width', 'image_height', 'segmentation_prompt',
+        }
+        missing = required - set(data.columns)
+        if missing:
+            raise ValueError(
+                f'SonoReason TSV is missing segmentation columns: {sorted(missing)}')
+        if data['mask'].isna().any() or data['mask'].astype(str).str.strip().eq('').any():
+            missing_count = int(
+                (data['mask'].isna() | data['mask'].astype(str).str.strip().eq('')).sum())
+            raise ValueError(
+                f'Segmentation dataset contains {missing_count} rows without masks')
+
+        rows = []
+        for source_index, source in data.iterrows():
+            width = int(source['image_width'])
+            height = int(source['image_height'])
+            question = (
+                f"{source['segmentation_prompt']}\n"
+                f'Original image dimensions: width={width}, height={height}.'
+            )
+            rows.append({
+                'index': source_index,
+                'patient_id': _json_scalar(source.get('patient_id')),
+                'dataset_name': _json_scalar(source.get('dataset_name')),
+                'anatomy_location': _json_scalar(source.get('anatomy_location')),
+                'feature': 'segmentation',
+                'image': source['img_data'],
+                'question': question,
+                'answer': source['segmentation_bbox_xyxy'],
+                'ground_truth_mask': source['mask'],
+                'ground_truth_bbox': source['segmentation_bbox_xyxy'],
+                'image_width': width,
+                'image_height': height,
+            })
+        return pd.DataFrame(rows)
+
+    @staticmethod
+    def _apply_sample_limit(data):
+        raw_limit = os.environ.get('SONOREASON_SAMPLE_LIMIT', '').strip()
+        if not raw_limit:
+            return data
+        try:
+            limit = int(raw_limit)
+        except ValueError as exc:
+            raise ValueError(
+                f'SONOREASON_SAMPLE_LIMIT must be an integer, got {raw_limit!r}'
+            ) from exc
+        if limit < 0:
+            raise ValueError('SONOREASON_SAMPLE_LIMIT must be non-negative')
+        if limit == 0:
+            return data
+        return data.head(limit).reset_index(drop=True)
+
     def _build_feature_data(self, data):
         prompt_file = os.environ.get('SONOREASON_FEATURE_PROMPTS_FILE')
         if not prompt_file:
@@ -411,8 +470,10 @@ class SonoReasonDD(ImageBaseDataset):
 
         strategy = canonical_strategy()
         df = pd.read_csv(path, sep='\t')
+        if strategy == 'segmentation':
+            return self._apply_sample_limit(self._build_segmentation_data(df))
         if strategy == 'feature':
-            return self._build_feature_data(df)
+            return self._apply_sample_limit(self._build_feature_data(df))
 
         # Two TSV shapes are in play: the published SonoReason schema read
         # straight from u2_ext_data/data/DD/ (img_data/direct_prompt/class_label),
@@ -460,7 +521,7 @@ class SonoReasonDD(ImageBaseDataset):
                     f'({per_class} x {n_classes} classes). SMOKE TEST: this is a '
                     f'format check, the metrics below are not results.'
                 )
-        return df
+        return self._apply_sample_limit(df)
 
     def build_prompt(self, line):
         if isinstance(line, int):
@@ -608,8 +669,185 @@ class SonoReasonDD(ImageBaseDataset):
             dump(measurement_metrics, eval_file.replace('.xlsx', '_measurement_mae.csv'))
         return metrics
 
+    @staticmethod
+    def _parse_segmentation_prediction(value, width, height):
+        parsed = SonoReasonDD._parse_feature_prediction(value)
+        if parsed is None or not parsed.get('lesion_present', True):
+            return None
+        bbox = parsed.get('bbox')
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            return None
+        try:
+            x0, y0, x1, y1 = [float(x) for x in bbox]
+        except (TypeError, ValueError):
+            return None
+        x0, x1 = sorted((
+            min(max(0.0, x0), float(width - 1)),
+            min(max(0.0, x1), float(width - 1)),
+        ))
+        y0, y1 = sorted((
+            min(max(0.0, y0), float(height - 1)),
+            min(max(0.0, y1), float(height - 1)),
+        ))
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            return None
+        return [x0, y0, x1, y1]
+
+    @staticmethod
+    @lru_cache(maxsize=2)
+    def _load_segmentor(model_name, device):
+        import torch
+        from transformers import SamModel, SamProcessor
+
+        processor = SamProcessor.from_pretrained(model_name)
+        model = SamModel.from_pretrained(model_name).to(device)
+        model.eval()
+        return processor, model
+
+    @staticmethod
+    def _segment_with_box(image, bbox):
+        import torch
+
+        requested_device = os.environ.get('SONOREASON_SEGMENTOR_DEVICE', 'auto')
+        if requested_device == 'auto':
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        else:
+            device = requested_device
+        model_name = os.environ.get(
+            'SONOREASON_SEGMENTOR_MODEL', 'wanglab/medsam-vit-base')
+        processor, model = SonoReasonDD._load_segmentor(model_name, device)
+        inputs = processor(images=image, input_boxes=[[bbox]], return_tensors='pt')
+        inputs = {name: tensor.to(device) for name, tensor in inputs.items()}
+        is_medsam = 'medsam' in model_name.lower()
+        with torch.inference_mode():
+            outputs = model(**inputs, multimask_output=not is_medsam)
+        masks = processor.image_processor.post_process_masks(
+            outputs.pred_masks.cpu(),
+            inputs['original_sizes'].cpu(),
+            inputs['reshaped_input_sizes'].cpu(),
+        )[0]
+        scores = outputs.iou_scores.detach().cpu().reshape(-1)
+        best = int(torch.argmax(scores).item())
+        candidates = masks.reshape(-1, masks.shape[-2], masks.shape[-1])
+        return candidates[best].numpy() > 0, float(scores[best].item()), model_name, device
+
+    @staticmethod
+    def _compute_monai_metrics(prediction, target):
+        import torch
+        from monai.metrics import (
+            DiceMetric, HausdorffDistanceMetric, MeanIoU,
+            compute_confusion_matrix_metric, get_confusion_matrix,
+        )
+
+        pred = torch.as_tensor(prediction.astype(bool))
+        truth = torch.as_tensor(target.astype(bool))
+        y_pred = torch.stack((~pred, pred), dim=0).unsqueeze(0).float()
+        y = torch.stack((~truth, truth), dim=0).unsqueeze(0).float()
+
+        dice = DiceMetric(include_background=False, reduction='mean', ignore_empty=False)
+        iou = MeanIoU(include_background=False, reduction='mean', ignore_empty=False)
+        hausdorff95 = HausdorffDistanceMetric(
+            include_background=False, percentile=95, reduction='mean')
+        dice(y_pred, y)
+        iou(y_pred, y)
+        hausdorff95(y_pred, y)
+        confusion = get_confusion_matrix(y_pred, y, include_background=False)
+
+        def scalar(value):
+            return float(torch.as_tensor(value).detach().cpu().nanmean().item())
+
+        return {
+            'dice': scalar(dice.aggregate()),
+            'iou': scalar(iou.aggregate()),
+            'precision': scalar(compute_confusion_matrix_metric('precision', confusion)),
+            'recall_sensitivity': scalar(
+                compute_confusion_matrix_metric('sensitivity', confusion)),
+            'specificity': scalar(
+                compute_confusion_matrix_metric('specificity', confusion)),
+            'pixel_accuracy': scalar(
+                compute_confusion_matrix_metric('accuracy', confusion)),
+            'hausdorff_distance_95_pixels': scalar(hausdorff95.aggregate()),
+        }
+
+    def _evaluate_segmentation(self, data, eval_file):
+        source_by_index = {
+            str(row['index']): row for _, row in self.data.iterrows()
+        }
+        output_dir = Path(eval_file).with_suffix('').with_name(
+            Path(eval_file).stem + '_predicted_masks')
+        output_dir.mkdir(parents=True, exist_ok=True)
+        records = []
+
+        for _, result in data.iterrows():
+            index = str(result['index'])
+            source = source_by_index.get(index)
+            record = {
+                'index': index,
+                'patient_id': result.get('patient_id'),
+                'prediction_parse_ok': False,
+                'segmentation_success': False,
+                'error': None,
+            }
+            if source is None:
+                record['error'] = f'No source row for index {index}'
+                records.append(record)
+                continue
+            bbox = self._parse_segmentation_prediction(
+                result['prediction'], int(source['image_width']), int(source['image_height']))
+            record['prediction_parse_ok'] = bbox is not None
+            record['predicted_bbox'] = json.dumps(bbox) if bbox is not None else None
+            if bbox is None:
+                record['error'] = 'Prediction does not contain a valid pixel-coordinate bbox'
+                records.append(record)
+                continue
+            try:
+                from ..smp.vlm import decode_base64_to_image
+
+                image = decode_base64_to_image(source['image']).convert('RGB')
+                truth_image = decode_base64_to_image(
+                    source['ground_truth_mask']).convert('L')
+                truth = np.asarray(truth_image) > 0
+                prediction, confidence, model_name, device = self._segment_with_box(image, bbox)
+                if prediction.shape != truth.shape:
+                    raise ValueError(
+                        f'Prediction shape {prediction.shape} != mask shape {truth.shape}')
+                metrics = self._compute_monai_metrics(prediction, truth)
+                mask_path = output_dir / f'{source.get("patient_id", index)}.png'
+                Image.fromarray(prediction.astype(np.uint8) * 255).save(mask_path)
+                record.update(metrics)
+                record.update({
+                    'segmentation_success': True,
+                    'segmentor_confidence': confidence,
+                    'segmentor_model': model_name,
+                    'segmentor_device': device,
+                    'predicted_mask_path': str(mask_path),
+                })
+            except Exception as exc:
+                record['error'] = f'{type(exc).__name__}: {exc}'
+            records.append(record)
+
+        details = pd.DataFrame(records)
+        dump(details, eval_file.replace('.xlsx', '_segmentation_details.csv'))
+        metric_names = [
+            'dice', 'iou', 'precision', 'recall_sensitivity', 'specificity',
+            'pixel_accuracy', 'hausdorff_distance_95_pixels', 'segmentor_confidence',
+        ]
+        summary = {
+            'prediction_parse_rate': details['prediction_parse_ok'].mean(),
+            'segmentation_success_rate': details['segmentation_success'].mean(),
+            'n': len(details),
+            'successful_n': int(details['segmentation_success'].sum()),
+        }
+        for metric in metric_names:
+            summary[metric] = details[metric].mean() if metric in details else None
+        metrics = pd.DataFrame([summary])
+        dump(metrics, eval_file.replace('.xlsx', '_segmentation_metrics.csv'))
+        return metrics
+
     def evaluate(self, eval_file, **kwargs):
         data = load(eval_file)
+        if 'feature' in data.columns and data['feature'].eq('segmentation').all():
+            return self._evaluate_segmentation(data, eval_file)
         if 'feature' in data.columns:
             return self._evaluate_features(data, eval_file)
 

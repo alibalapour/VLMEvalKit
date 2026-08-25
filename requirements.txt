@@ -68,3 +68,4 @@ typing_extensions
 validators
 xlsxwriter
 zss>=1.2.0
+monai>=1.3
