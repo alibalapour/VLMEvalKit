@@ -5,6 +5,7 @@ torch.manual_seed(1234)
 
 # Added models
 from .medgemma import MedGemma
+from .sonoreason_segmentation_agent import SonoReasonSegmentationAgent
 from .mistral import MistralSmall
 from .llava_med import LLaVAMed
 

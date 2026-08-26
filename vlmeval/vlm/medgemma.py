@@ -75,8 +75,10 @@ class MedGemma(BaseModel):
         content = []
         for msg in message:
             if msg['type'] == 'image':
-                content.append({'type': 'image',
-                                'image': Image.open(msg['value']).convert('RGB')})
+                source = msg['value']
+                image = (source.copy().convert('RGB') if isinstance(source, Image.Image)
+                         else Image.open(source).convert('RGB'))
+                content.append({'type': 'image', 'image': image})
             elif msg['type'] == 'text':
                 content.append({'type': 'text', 'text': msg['value']})
         messages = [{'role': 'user', 'content': content}]

@@ -346,16 +346,37 @@ class SonoReasonDD(ImageBaseDataset):
         if missing:
             raise ValueError(
                 f'SonoReason TSV is missing segmentation columns: {sorted(missing)}')
-        if data['mask'].isna().any() or data['mask'].astype(str).str.strip().eq('').any():
-            missing_count = int(
-                (data['mask'].isna() | data['mask'].astype(str).str.strip().eq('')).sum())
+
+        # A source diagnosis table may contain only partial segmentation
+        # coverage. Segmentation evaluation must never fail the whole run or,
+        # worse, score a row with no ground truth. Keep only rows carrying an
+        # encoded mask and report exactly how many were skipped. Intentionally
+        # do not reject a decoded all-zero mask here: the published SEG tables
+        # use those for verified normal/no-lesion examples.
+        has_mask = data['mask'].notna() & data['mask'].astype(str).str.strip().ne('')
+        skipped = int((~has_mask).sum())
+        if skipped:
+            logger.warning(
+                f'[SonoReasonDD] skipping {skipped}/{len(data)} segmentation rows '
+                'because no ground-truth mask is present'
+            )
+        data = data.loc[has_mask].reset_index(drop=True)
+        if data.empty:
             raise ValueError(
-                f'Segmentation dataset contains {missing_count} rows without masks')
+                'No rows with segmentation masks remain. Select a file under SEG/; '
+                'datasets without masks cannot be evaluated for segmentation.')
 
         rows = []
         for source_index, source in data.iterrows():
             width = int(source['image_width'])
             height = int(source['image_height'])
+            sample_id = str(source.get('sample_id') or source.get('patient_id') or source_index)
+            image_name = Path(sample_id).name
+            if not Path(image_name).suffix:
+                image_name += '.png'
+            dataset_folder = re.sub(
+                r'[^A-Za-z0-9_.-]+', '_', str(source.get('dataset_name') or 'unknown')
+            ).strip('._') or 'unknown'
             question = (
                 f"{source['segmentation_prompt']}\n"
                 f'Original image dimensions: width={width}, height={height}.'
@@ -363,11 +384,17 @@ class SonoReasonDD(ImageBaseDataset):
             rows.append({
                 'index': source_index,
                 'patient_id': _json_scalar(source.get('patient_id')),
+                'sample_id': sample_id,
                 'dataset_name': _json_scalar(source.get('dataset_name')),
                 'anatomy_location': _json_scalar(source.get('anatomy_location')),
                 'feature': 'segmentation',
                 'image': source['img_data'],
+                'image_path': f'{dataset_folder}/{image_name}',
                 'question': question,
+                'segmentation_prompt': source['segmentation_prompt'],
+                'segmentation_verification_prompt': _json_scalar(
+                    source.get('segmentation_verification_prompt')),
+                'segmentation_target': _json_scalar(source.get('segmentation_target')),
                 'answer': source['segmentation_bbox_xyxy'],
                 'ground_truth_mask': source['mask'],
                 'ground_truth_bbox': source['segmentation_bbox_xyxy'],
@@ -537,7 +564,15 @@ class SonoReasonDD(ImageBaseDataset):
         # load_data. sonoreason_dd_breast has a template registered below, so
         # without this guard the registry would overwrite all seven of them.
         if 'feature' in line.index:
-            msgs.append(dict(type='text', value=line['question']))
+            text = line['question']
+            if not self._prompt_logged:
+                logger.info(
+                    f'[SonoReasonDD] dataset={self.dataset_name} '
+                    f'prompt_strategy={canonical_strategy()} -- prompt sent to the model '
+                    f'(first sample):\n{text}'
+                )
+                self._prompt_logged = True
+            msgs.append(dict(type='text', value=text))
             return msgs
 
         prompt_strategy = canonical_strategy()
@@ -792,28 +827,53 @@ class SonoReasonDD(ImageBaseDataset):
                 record['error'] = f'No source row for index {index}'
                 records.append(record)
                 continue
-            bbox = self._parse_segmentation_prediction(
-                result['prediction'], int(source['image_width']), int(source['image_height']))
-            record['prediction_parse_ok'] = bbox is not None
-            record['predicted_bbox'] = json.dumps(bbox) if bbox is not None else None
-            if bbox is None:
-                record['error'] = 'Prediction does not contain a valid pixel-coordinate bbox'
-                records.append(record)
-                continue
             try:
                 from ..smp.vlm import decode_base64_to_image
 
-                image = decode_base64_to_image(source['image']).convert('RGB')
                 truth_image = decode_base64_to_image(
                     source['ground_truth_mask']).convert('L')
                 truth = np.asarray(truth_image) > 0
-                prediction, confidence, model_name, device = self._segment_with_box(image, bbox)
+                agent_result = self._parse_feature_prediction(result['prediction'])
+                if agent_result and 'mask_path' in agent_result:
+                    mask_path = Path(agent_result['mask_path'])
+                    if agent_result.get('status') != 'completed' or not mask_path.is_file():
+                        raise ValueError(
+                            f"Agent mask unavailable: status={agent_result.get('status')}, "
+                            f"path={mask_path}")
+                    prediction = np.asarray(Image.open(mask_path).convert('L')) > 0
+                    bbox = agent_result.get('bbox')
+                    confidence = agent_result.get('segmentor_confidence')
+                    model_name = agent_result.get('segmentor_model')
+                    device = agent_result.get('segmentor_device')
+                    record.update({
+                        'prediction_parse_ok': True,
+                        'predicted_bbox': json.dumps(bbox),
+                        'agent_accepted': agent_result.get('accepted'),
+                        'agent_attempts': agent_result.get('attempts'),
+                        'vlm_backend': agent_result.get('vlm_backend'),
+                        'vlm_model': agent_result.get('vlm_model'),
+                    })
+                else:
+                    # Backward-compatible path for older single-box predictions.
+                    bbox = self._parse_segmentation_prediction(
+                        result['prediction'], int(source['image_width']),
+                        int(source['image_height']))
+                    if bbox is None:
+                        raise ValueError(
+                            'Prediction contains neither an agent mask nor a valid bbox')
+                    image = decode_base64_to_image(source['image']).convert('RGB')
+                    prediction, confidence, model_name, device = self._segment_with_box(
+                        image, bbox)
+                    mask_path = output_dir / f'{source.get("patient_id", index)}.png'
+                    Image.fromarray(prediction.astype(np.uint8) * 255).save(mask_path)
+                    record.update({
+                        'prediction_parse_ok': True,
+                        'predicted_bbox': json.dumps(bbox),
+                    })
                 if prediction.shape != truth.shape:
                     raise ValueError(
                         f'Prediction shape {prediction.shape} != mask shape {truth.shape}')
                 metrics = self._compute_monai_metrics(prediction, truth)
-                mask_path = output_dir / f'{source.get("patient_id", index)}.png'
-                Image.fromarray(prediction.astype(np.uint8) * 255).save(mask_path)
                 record.update(metrics)
                 record.update({
                     'segmentation_success': True,
