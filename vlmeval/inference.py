@@ -193,7 +193,7 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
             print(response, flush=True)
 
         res[idx] = response
-        if (i + 1) % 10 == 0:
+        if model_name == 'SonoReason-Segmentation-Agent' or (i + 1) % 10 == 0:
             dump(res, out_file)
 
     res = {k: res[k] for k in data_indices}

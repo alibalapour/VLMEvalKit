@@ -172,7 +172,20 @@ class SonoReasonSegmentationAgent(BaseModel):
         if not image_paths:
             raise ValueError('Segmentation agent requires one ultrasound image')
         image = Image.open(image_paths[0]).convert('RGB')
-        localization = self._json(self._vlm([image], prompt))
+        try:
+            localization = self._json(self._vlm([image], prompt))
+        except Exception as exc:
+            return json.dumps({
+                'status': 'failed_localization',
+                'error': f'{type(exc).__name__}: {exc}',
+                'mask_path': None,
+                'bbox': None,
+                'accepted': False,
+                'attempts': 0,
+                'vlm_backend': self.backend,
+                'vlm_model': self.vlm_model_name,
+                'segmentor_model': self.segmentor_model,
+            })
         if not localization.get('lesion_present', True):
             mask = np.zeros((image.height, image.width), bool)
             bbox, accepted, attempts = [], True, 0
@@ -181,6 +194,7 @@ class SonoReasonSegmentationAgent(BaseModel):
             if bbox is None:
                 return json.dumps({'status': 'skipped_invalid_bbox', 'bbox': None})
             accepted = False
+            verification_error = None
             for attempt in range(self.max_refinements + 1):
                 mask, confidence = self._segment(image, bbox)
                 overlay = self._overlay(image, mask, bbox)
@@ -188,8 +202,15 @@ class SonoReasonSegmentationAgent(BaseModel):
                     f'{VERIFY_PROMPT}\n\nORIGINAL SEGMENTATION TASK:\n{prompt}\n\n'
                     'Judge only whether the green mask segments that specified target.'
                 )
-                verification = self._json(
-                    self._vlm([image, overlay], verification_prompt))
+                try:
+                    verification = self._json(
+                        self._vlm([image, overlay], verification_prompt))
+                except Exception as exc:
+                    # The current SAM mask is still a usable prediction. A VLM
+                    # formatting/length/network failure must not abort all
+                    # remaining dataset rows.
+                    verification_error = f'{type(exc).__name__}: {exc}'
+                    break
                 accepted = verification.get('accept') is True
                 attempts = attempt + 1
                 if accepted or attempt == self.max_refinements:
@@ -212,6 +233,7 @@ class SonoReasonSegmentationAgent(BaseModel):
             'status': 'completed', 'mask_path': str(mask_path), 'bbox': bbox,
             'accepted': accepted, 'attempts': attempts,
             'segmentor_confidence': confidence if attempts else None,
+            'verification_error': verification_error if attempts else None,
             'vlm_backend': self.backend, 'vlm_model': self.vlm_model_name,
             'segmentor_model': self.segmentor_model,
         })

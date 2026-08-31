@@ -850,6 +850,7 @@ class SonoReasonDD(ImageBaseDataset):
                         'predicted_bbox': json.dumps(bbox),
                         'agent_accepted': agent_result.get('accepted'),
                         'agent_attempts': agent_result.get('attempts'),
+                        'verification_error': agent_result.get('verification_error'),
                         'vlm_backend': agent_result.get('vlm_backend'),
                         'vlm_model': agent_result.get('vlm_model'),
                     })
