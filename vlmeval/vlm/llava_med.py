@@ -1,7 +1,7 @@
 import torch
 from PIL import Image
 from .base import BaseModel
-from .sonoreason_gen import default_gen_kwargs
+from .sonoreason_gen import apply_prefill, default_gen_kwargs, resolve_prefill
 
 class LLaVAMed(BaseModel):
     INSTALL_REQ = False
@@ -18,6 +18,11 @@ class LLaVAMed(BaseModel):
         # trigram ['<','answer','>'], which occurs in the prompt and was
         # therefore banned outright -- every reasoning run scored exactly 0.
         self.gen_kwargs = default_gen_kwargs(tokenizer=self.processor.tokenizer, **kwargs)
+        # This model answers a JSON request with prose *about* the JSON it was
+        # asked for -- 0/24 objects on the structured arm. Prefilling the
+        # assistant turn with '{' makes that continuation unreachable. See the
+        # long note in sonoreason_gen.py.
+        self.prefill_ids, self.prefill_text = resolve_prefill(self.processor.tokenizer)
 
     def generate_inner(self, message, dataset=None):
         content = []
@@ -32,7 +37,14 @@ class LLaVAMed(BaseModel):
             messages, add_generation_prompt=True, tokenize=True,
             return_dict=True, return_tensors='pt'
         ).to(self.model.device, dtype=torch.bfloat16)
-        in_len = inputs['input_ids'].shape[-1]
+        if self.prefill_ids:
+            in_len = apply_prefill(inputs, self.prefill_ids)
+        else:
+            in_len = inputs['input_ids'].shape[-1]
         with torch.inference_mode():
             out = self.model.generate(**inputs, **self.gen_kwargs)
-        return self.processor.decode(out[0][in_len:], skip_special_tokens=True).strip()
+        text = self.processor.decode(out[0][in_len:], skip_special_tokens=True)
+        # The prefill is the first character of the answer, not scaffolding, so
+        # it goes back on -- otherwise the parser gets an object with no opening
+        # brace. (Contrast medgemma.py, where the prefill is dropped.)
+        return (self.prefill_text + text).strip()
