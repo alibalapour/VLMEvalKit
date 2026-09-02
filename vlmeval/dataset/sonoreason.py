@@ -461,21 +461,26 @@ class SonoReasonDD(ImageBaseDataset):
         return pd.DataFrame(rows)
 
     @staticmethod
-    def _apply_sample_limit(data):
-        raw_limit = os.environ.get('SONOREASON_SAMPLE_LIMIT', '').strip()
-        if not raw_limit:
-            return data
-        try:
-            limit = int(raw_limit)
-        except ValueError as exc:
-            raise ValueError(
-                f'SONOREASON_SAMPLE_LIMIT must be an integer, got {raw_limit!r}'
-            ) from exc
-        if limit < 0:
-            raise ValueError('SONOREASON_SAMPLE_LIMIT must be non-negative')
-        if limit == 0:
-            return data
-        return data.head(limit).reset_index(drop=True)
+    def _configured_limit():
+        """Resolve the legacy and API/segmentation limit variables as one setting."""
+        values = {}
+        for name in ('SONOREASON_LIMIT', 'SONOREASON_SAMPLE_LIMIT'):
+            raw = os.environ.get(name, '').strip()
+            if not raw:
+                continue
+            try:
+                value = int(raw)
+            except ValueError as exc:
+                raise ValueError(f'{name} must be an integer, got {raw!r}') from exc
+            if value < 0:
+                raise ValueError(f'{name} must be non-negative')
+            values[name] = value
+        if not values:
+            return None, None
+        if len(set(values.values())) > 1:
+            rendered = ', '.join(f'{name}={value}' for name, value in values.items())
+            raise ValueError(f'Conflicting SonoReason sample limits: {rendered}')
+        return '/'.join(values), next(iter(values.values()))
 
     def _build_feature_data(self, data):
         prompt_file = os.environ.get('SONOREASON_FEATURE_PROMPTS_FILE')
@@ -504,7 +509,6 @@ class SonoReasonDD(ImageBaseDataset):
         ].reset_index(drop=True)
         rows = []
         for source_index, source in data.iterrows():
-            primary_image_index = f'{source_index}__shape'
             for feature, spec in FEATURE_SPECS.items():
                 label = _json_scalar(source[spec['label']])
                 if label is None:
@@ -533,10 +537,10 @@ class SonoReasonDD(ImageBaseDataset):
                     'dataset_name': _json_scalar(source.get('dataset_name')),
                     'anatomy_location': 'breast',
                     'feature': feature,
-                    # Store base64 once per source image. Other feature rows use
-                    # VLMEvalKit's short-index image reference mechanism.
-                    'image': (
-                        source['img_data'] if feature == 'shape' else primary_image_index),
+                    # Each expanded row must remain self-contained. ImageBaseDataset
+                    # treats every string in `image` as base64; it has no row-reference
+                    # mechanism, and warm image caches previously hid that failure.
+                    'image': source['img_data'],
                     'question': prompts[feature],
                     'answer': str(label),
                     'ground_truth_measurements': json.dumps(measurements),
@@ -547,37 +551,28 @@ class SonoReasonDD(ImageBaseDataset):
         return pd.DataFrame(rows)
 
     def _apply_limit(self, df, stratify_on='answer'):
-        """Cut the frame down to a smoke-test sample, or return it unchanged.
-
-        SONOREASON_LIMIT=<n> keeps roughly n rows, stratified by `stratify_on`
-        and order-preserving, so every class is represented (a plain head(n) on
-        these files can return a single class) and two models see byte-identical
-        rows. A smoke run is a format check, never a result: n is far too small
-        for the per-class metrics to mean anything.
-        """
-        limit = os.environ.get('SONOREASON_LIMIT')
-        if not limit:
+        """Apply either supported smoke/API limit, optionally stratified."""
+        limit_name, n = self._configured_limit()
+        if n in (None, 0) or n >= len(df):
             return df
-        n = int(limit)
-        if n >= len(df):
-            return df
-        if stratify_on not in df.columns:
-            logger.warning(
-                f'[SonoReasonDD] SONOREASON_LIMIT set but {stratify_on!r} is not a '
-                f'column; falling back to an unstratified head({n}).')
-            return df.head(n).reset_index(drop=True)
-        n_classes = max(1, df[stratify_on].nunique())
-        per_class = max(1, n // n_classes)
-        # groupby().head() keeps the file's original row order and does not
-        # touch the `index` column VLMEvalKit keys its cache on.
-        out = (df.groupby(stratify_on, sort=True)
-                 .head(per_class)
-                 .sort_index()
-                 .reset_index(drop=True))
+        if stratify_on is None or stratify_on not in df.columns:
+            if stratify_on is not None:
+                logger.warning(
+                    f'[SonoReasonDD] {limit_name} set but {stratify_on!r} is not a '
+                    f'column; falling back to an unstratified head({n}).')
+            out = df.head(n).reset_index(drop=True)
+        else:
+            groups = list(df.groupby(stratify_on, sort=True, dropna=False))
+            per_class, remainder = divmod(n, len(groups))
+            parts = []
+            for offset, (_, group) in enumerate(groups):
+                take = per_class + (offset < remainder)
+                if take:
+                    parts.append(group.head(take))
+            out = pd.concat(parts).sort_index().reset_index(drop=True)
         logger.warning(
-            f'[SonoReasonDD] SONOREASON_LIMIT={n} -> {len(out)} rows '
-            f'({per_class} x {n_classes} {stratify_on} values). SMOKE TEST: this is '
-            f'a format check, the metrics below are not results.')
+            f'[SonoReasonDD] {limit_name}={n} -> {len(out)} rows. SMOKE TEST: '
+            f'this is a format check, the metrics below are not results.')
         return out
 
     def load_data(self, dataset):
@@ -594,14 +589,12 @@ class SonoReasonDD(ImageBaseDataset):
         strategy = canonical_strategy()
         df = pd.read_csv(path, sep='\t')
         if strategy == 'segmentation':
-            return self._apply_sample_limit(self._build_segmentation_data(df))
+            return self._apply_limit(
+                self._build_segmentation_data(df), stratify_on=None)
         if strategy == 'feature':
-            # Both limits operate on source images before the seven-row feature
-            # expansion, so their values consistently mean images rather than
-            # generations. Eligibility also runs first because some source TSVs
-            # contain non-breast or unlabeled rows that contribute no feature rows.
+            # Eligibility and limiting run before the seven-row feature
+            # expansion, so a configured limit always counts source images.
             df = _feature_eligible(df)
-            df = self._apply_sample_limit(df)
             df = self._apply_limit(df, stratify_on='class_label')
             return self._build_feature_data(df)
 
@@ -626,8 +619,7 @@ class SonoReasonDD(ImageBaseDataset):
             })
             df['index'] = range(len(df))
 
-        df = self._apply_limit(df)
-        return self._apply_sample_limit(df)
+        return self._apply_limit(df)
 
     def build_prompt(self, line):
         if isinstance(line, int):

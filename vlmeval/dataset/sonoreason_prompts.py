@@ -7,8 +7,8 @@ from typing import Any
 # Structured arm: measure-then-decide.
 #
 # The model sees only the image -- never a mask -- and is asked to estimate
-# visual proxies for the same quantities datset_creation/mask_metrics.py
-# computes from the expert mask, using the SAME thresholds. That is what makes
+# visual proxies for quantities already computed from the expert masks in the
+# source TSV's measurement columns, using the SAME thresholds. That is what makes
 # the run analysable two ways at once: label agreement against the mask-derived
 # `lesion_*_label` columns, and numeric agreement against the mask-derived
 # measurement columns (border_solidity, echo_lesion_to_reference_ratio, ...).
