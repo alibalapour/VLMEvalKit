@@ -1,6 +1,20 @@
 from __future__ import annotations
 
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
+
+
+PROMPT_DIR = Path(__file__).resolve().parents[3] / 'experiments' / 'prompts'
+
+
+@lru_cache(maxsize=None)
+def load_prompt_file(filename: str) -> str:
+    """Read an experiment prompt verbatim from experiments/prompts."""
+    path = PROMPT_DIR / filename
+    if not path.is_file():
+        raise FileNotFoundError(f'SonoReason prompt file not found: {path}')
+    return path.read_text(encoding='utf-8').strip()
 
 
 # ---------------------------------------------------------------------------

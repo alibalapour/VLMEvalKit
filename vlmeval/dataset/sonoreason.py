@@ -1,4 +1,6 @@
 import ast
+import base64
+import io
 import json
 import os
 import re
@@ -11,7 +13,11 @@ from json_repair import loads as load_json_repair
 from PIL import Image
 
 from .image_base import ImageBaseDataset
-from .sonoreason_prompts import resolve_prompt_template, build_prompt_variants
+from .sonoreason_prompts import (
+    build_prompt_variants,
+    load_prompt_file,
+    resolve_prompt_template,
+)
 from ..smp import get_logger, load, dump
 
 logger = get_logger(__name__)
@@ -287,8 +293,43 @@ FEATURE_SPECS = {
     },
 }
 
+# Exact output contract for the image+mask measurement strategy.  This is kept
+# separate from FEATURE_SPECS because the older feature/diagnosis benchmark also
+# evaluates derived ratios and decision-rule inputs that the primitive-only
+# prompts intentionally no longer request.
+MASK_MEASUREMENT_COLUMNS = {
+    'shape': {
+        'long_axis': 'long_axis_pixels',
+        'short_axis': 'short_axis_pixels',
+    },
+    'orientation': {
+        'orientation_degrees': 'orientation_degrees',
+    },
+    'margin': {
+        'short_axis': 'short_axis_pixels',
+        'inner_border_median': 'margin_inner_border_median',
+        'outer_border_median': 'margin_outer_border_median',
+    },
+    'border': {
+        'solidity_proxy': 'border_solidity',
+        'perimeter_to_hull_ratio_proxy': 'border_perimeter_to_hull_ratio',
+    },
+    'echo_pattern': {
+        'short_axis': 'short_axis_pixels',
+        'lesion_core_median': 'echo_lesion_median',
+        'echo_reference_median': 'echo_reference_median',
+        'lesion_iqr': 'echotexture_lesion_iqr',
+    },
+    'posterior_feature': {
+        'bounding_box_width': 'posterior_bounding_box_width',
+        'bounding_box_height': 'posterior_bounding_box_height',
+        'posterior_strip_median': 'posterior_strip_median',
+        'posterior_reference_median': 'posterior_reference_median',
+    },
+}
 
-def _load_feature_prompts(path):
+
+def _load_feature_prompts(path, features=None):
     text = Path(path).read_text()
     pattern = re.compile(
         r'^=+\n\d+\.\s+(.+?) PROMPT\n=+\n\n(.*?)(?=^=+\n\d+\.|\Z)',
@@ -296,10 +337,13 @@ def _load_feature_prompts(path):
     )
     by_heading = {heading.strip(): prompt.strip() for heading, prompt in pattern.findall(text)}
     prompts = {}
-    for feature, spec in FEATURE_SPECS.items():
+    selected = FEATURE_SPECS if features is None else {
+        feature: FEATURE_SPECS[feature] for feature in features
+    }
+    for feature, spec in selected.items():
         heading = spec['heading']
         if heading not in by_heading:
-            raise ValueError(f'Missing {heading!r} section in breast feature prompt file: {path}')
+            raise ValueError(f'Missing {heading!r} section in feature prompt file: {path}')
         prompts[feature] = by_heading[heading]
     return prompts
 
@@ -312,61 +356,13 @@ def _json_scalar(value):
     return value
 
 
-def _feature_eligible(df):
-    """Rows the feature arm can actually build a question from.
-
-    Two filters, both of which _build_feature_data would otherwise apply after
-    the smoke limit had already been taken -- which makes the limit mean
-    "n rows sampled" rather than "n images evaluated". bus_uclm carries
-    descriptor labels for only a fraction of its rows, so a nominal 100-image
-    cell silently came out at 33 while every other dataset got 100. Cells of
-    different sizes are not comparable, and the shortfall is invisible in the
-    result file.
-
-    Applying them up front also means the limit's class stratification is
-    computed over the rows that survive, not over rows that are about to be
-    discarded.
-    """
-    n0 = len(df)
-    if 'anatomy_location' in df.columns:
-        df = df[df['anatomy_location'].astype(str).str.lower().eq('breast')]
-    label_cols = [spec['label'] for spec in FEATURE_SPECS.values()
-                  if spec['label'] in df.columns]
-    if label_cols:
-        # An image with no descriptor label at all contributes zero rows to the
-        # expansion; one with some labels still contributes those.
-        df = df[df[label_cols].notna().any(axis=1)]
-    df = df.reset_index(drop=True)
-    if len(df) < n0:
-        logger.info(
-            f'[SonoReasonDD] feature arm: {len(df)}/{n0} rows are eligible '
-            f'(breast, with at least one descriptor label).')
-    return df
-
-
-def _assert_predictions_present(data, eval_file):
-    """Fail loudly when the prediction column is empty.
-
-    Job 56143146 wrote an all-null prediction column, scored every metric 0.0,
-    and reported status "done" with infer_fail_rate 0.00% -- a result file that
-    looks like a finished experiment whose real content is "inference never
-    ran". A run that produced no text at all is an infrastructure failure and
-    must not be scoreable: 0.0 accuracy is a claim about a model, and this is
-    not one.
-    """
-    if 'prediction' not in data.columns:
-        raise ValueError(
-            f'{eval_file} has no prediction column -- inference did not run.')
-    n_null = int(data['prediction'].isna().sum())
-    if n_null == len(data):
-        raise ValueError(
-            f'{eval_file}: all {len(data)} predictions are null -- inference did '
-            f'not run. Refusing to score this as 0.0; check the inference log '
-            f'for the model load or the generation step failing.')
-    if n_null:
-        logger.warning(
-            f'[SonoReasonDD] {n_null}/{len(data)} predictions are null (inference '
-            f'produced nothing for those rows); they are scored as failures.')
+def _encoded_image_size(value):
+    """Return (width, height) for a base64 image, including data-URL inputs."""
+    encoded = str(value).strip()
+    if encoded.startswith('data:'):
+        encoded = encoded.split(',', 1)[1]
+    with Image.open(io.BytesIO(base64.b64decode(encoded))) as image:
+        return image.size
 
 
 class SonoReasonDD(ImageBaseDataset):
@@ -461,44 +457,60 @@ class SonoReasonDD(ImageBaseDataset):
         return pd.DataFrame(rows)
 
     @staticmethod
-    def _configured_limit():
-        """Resolve the legacy and API/segmentation limit variables as one setting."""
-        values = {}
-        for name in ('SONOREASON_LIMIT', 'SONOREASON_SAMPLE_LIMIT'):
-            raw = os.environ.get(name, '').strip()
-            if not raw:
-                continue
+    def _apply_sample_limit(data):
+        raw_shard_count = os.environ.get('SONOREASON_SHARD_COUNT', '').strip()
+        raw_shard_index = os.environ.get('SONOREASON_SHARD_INDEX', '').strip()
+        if raw_shard_count or raw_shard_index:
             try:
-                value = int(raw)
+                shard_count = int(raw_shard_count)
+                shard_index = int(raw_shard_index)
             except ValueError as exc:
-                raise ValueError(f'{name} must be an integer, got {raw!r}') from exc
-            if value < 0:
-                raise ValueError(f'{name} must be non-negative')
-            values[name] = value
-        if not values:
-            return None, None
-        if len(set(values.values())) > 1:
-            rendered = ', '.join(f'{name}={value}' for name, value in values.items())
-            raise ValueError(f'Conflicting SonoReason sample limits: {rendered}')
-        return '/'.join(values), next(iter(values.values()))
+                raise ValueError(
+                    'SONOREASON_SHARD_COUNT and SONOREASON_SHARD_INDEX must be integers'
+                ) from exc
+            if shard_count < 1:
+                raise ValueError('SONOREASON_SHARD_COUNT must be positive')
+            if not 0 <= shard_index < shard_count:
+                raise ValueError(
+                    f'SONOREASON_SHARD_INDEX must be in [0, {shard_count}), '
+                    f'got {shard_index}')
+            # Strided assignment balances systematic ordering effects and keeps
+            # each original dataset row in exactly one shard.
+            data = data.iloc[shard_index::shard_count].reset_index(drop=True)
 
-    def _build_feature_data(self, data):
+        raw_limit = os.environ.get('SONOREASON_SAMPLE_LIMIT', '').strip()
+        if not raw_limit:
+            return data
+        try:
+            limit = int(raw_limit)
+        except ValueError as exc:
+            raise ValueError(
+                f'SONOREASON_SAMPLE_LIMIT must be an integer, got {raw_limit!r}'
+            ) from exc
+        if limit < 0:
+            raise ValueError('SONOREASON_SAMPLE_LIMIT must be non-negative')
+        if limit == 0:
+            return data
+        return data.head(limit).reset_index(drop=True)
+
+    def _build_feature_data(
+            self, data, with_candidate_mask=False, qualitative_mask_prompt=False):
         prompt_file = os.environ.get('SONOREASON_FEATURE_PROMPTS_FILE')
         if not prompt_file:
             raise ValueError(
                 'feature_diagnosis requires SONOREASON_FEATURE_PROMPTS_FILE')
         prompts = _load_feature_prompts(prompt_file)
 
-        # `bbox` is deliberately NOT required: it only supplies
-        # bounding_box_width/height for posterior_feature, the one consumer
-        # already tolerates its absence via try/except, and requiring it locks
-        # out bus_uc / bus_uclm / open_access_breast, which carry all seven
-        # labels and every measurement column but no bbox.
-        required = {'img_data', 'anatomy_location'}
+        required = {'img_data', 'anatomy_location', 'bbox'}
+        uses_mask = with_candidate_mask or qualitative_mask_prompt
+        if uses_mask:
+            required.update({
+                'patient_id', 'dataset_name', 'direct_prompt', 'class_label'})
         for spec in FEATURE_SPECS.values():
             required.add(spec['label'])
             required.update(spec['measurements'].values())
-            required.update(spec['thresholds'].values())
+            if not qualitative_mask_prompt:
+                required.update(spec['thresholds'].values())
         missing = required - set(data.columns)
         if missing:
             raise ValueError(
@@ -507,8 +519,30 @@ class SonoReasonDD(ImageBaseDataset):
         data = data[
             data['anatomy_location'].astype(str).str.lower().eq('breast')
         ].reset_index(drop=True)
+        mask_root = None
+        if uses_mask:
+            raw_mask_root = os.environ.get('SONOREASON_CANDIDATE_MASK_DIR', '').strip()
+            if not raw_mask_root:
+                raise ValueError(
+                    f'{canonical_strategy()} requires SONOREASON_CANDIDATE_MASK_DIR')
+            mask_root = Path(raw_mask_root)
+            if not mask_root.is_dir():
+                raise FileNotFoundError(
+                    f'Candidate mask directory not found: {mask_root}')
         rows = []
+        missing_mask_sources = 0
         for source_index, source in data.iterrows():
+            candidate_mask_path = None
+            if uses_mask:
+                dataset_folder = re.sub(
+                    r'[^A-Za-z0-9_.-]+', '_', str(source['dataset_name'])
+                ).strip('._') or 'unknown'
+                mask_name = Path(str(source['patient_id'])).stem + '.png'
+                candidate_mask_path = mask_root / dataset_folder / mask_name
+                if not candidate_mask_path.is_file():
+                    missing_mask_sources += 1
+                    continue
+            primary_image_index = f'{source_index}__shape'
             for feature, spec in FEATURE_SPECS.items():
                 label = _json_scalar(source[spec['label']])
                 if label is None:
@@ -518,62 +552,197 @@ class SonoReasonDD(ImageBaseDataset):
                     for target, column in spec['measurements'].items()
                     if _json_scalar(source[column]) is not None
                 }
-                if feature == 'posterior_feature' and 'bbox' in source.index:
+                if feature == 'posterior_feature':
                     try:
                         _, _, width, height = ast.literal_eval(str(source['bbox']))
                         measurements['bounding_box_width'] = _json_scalar(width)
                         measurements['bounding_box_height'] = _json_scalar(height)
                     except (TypeError, ValueError, SyntaxError):
                         pass
-                thresholds = {
+                thresholds = {} if qualitative_mask_prompt else {
                     target: _json_scalar(source[column])
                     for target, column in spec['thresholds'].items()
                     if _json_scalar(source[column]) is not None
                 }
-                rows.append({
+                feature_question = prompts[feature]
+                if uses_mask:
+                    wrapper_file = (
+                        'mask_visual_features.txt'
+                        if qualitative_mask_prompt else 'mask_plus_features.txt')
+                    feature_question = load_prompt_file(wrapper_file).format(
+                        feature_name=feature,
+                        feature_prompt=feature_question,
+                        diagnostic_question=str(source['direct_prompt']).strip(),
+                    )
+                row = {
                     'index': f'{source_index}__{feature}',
                     'source_index': source_index,
                     'patient_id': _json_scalar(source.get('patient_id')),
                     'dataset_name': _json_scalar(source.get('dataset_name')),
                     'anatomy_location': 'breast',
                     'feature': feature,
-                    # Each expanded row must remain self-contained. ImageBaseDataset
-                    # treats every string in `image` as base64; it has no row-reference
-                    # mechanism, and warm image caches previously hid that failure.
-                    'image': source['img_data'],
-                    'question': prompts[feature],
+                    # Store base64 once per source image. Other feature rows use
+                    # VLMEvalKit's short-index image reference mechanism.
+                    'image': (
+                        source['img_data'] if feature == 'shape' else primary_image_index),
+                    'question': feature_question,
                     'answer': str(label),
                     'ground_truth_measurements': json.dumps(measurements),
                     'ground_truth_thresholds': json.dumps(thresholds),
-                })
+                }
+                if uses_mask:
+                    row.update({
+                        'diagnosis_answer': str(source['class_label']),
+                    })
+                    row['candidate_mask_path'] = str(candidate_mask_path.resolve())
+                rows.append(row)
+        if uses_mask:
+            logger.warning(
+                f'[SonoReasonDD] {canonical_strategy()} retained '
+                f'{len(data) - missing_mask_sources}/{len(data)} source images with '
+                f'candidate masks; skipped {missing_mask_sources} without masks')
         if not rows:
             raise ValueError('No labeled breast rows are available for feature_diagnosis')
         return pd.DataFrame(rows)
 
-    def _apply_limit(self, df, stratify_on='answer'):
-        """Apply either supported smoke/API limit, optionally stratified."""
-        limit_name, n = self._configured_limit()
-        if n in (None, 0) or n >= len(df):
-            return df
-        if stratify_on is None or stratify_on not in df.columns:
-            if stratify_on is not None:
+    def _build_mask_measurement_data(self, data):
+        """Build anatomy-aware image+mask measurement rows from published DD data."""
+        prompt_file = os.environ.get('SONOREASON_FEATURE_PROMPTS_FILE')
+        if not prompt_file:
+            raise ValueError(
+                'mask_visual_features requires SONOREASON_FEATURE_PROMPTS_FILE')
+        measurement_features = list(MASK_MEASUREMENT_COLUMNS)
+        prompts = _load_feature_prompts(prompt_file, measurement_features)
+        required = {
+            'img_data', 'mask', 'anatomy_location', 'patient_id', 'dataset_name',
+        }
+        for columns in MASK_MEASUREMENT_COLUMNS.values():
+            required.update(columns.values())
+        missing = required - set(data.columns)
+        if missing:
+            raise ValueError(
+                'mask_visual_features expects a published mask-bearing DD table; '
+                f'missing columns: {sorted(missing)}')
+
+        has_mask = data['mask'].notna() & data['mask'].astype(str).str.strip().ne('')
+        skipped = int((~has_mask).sum())
+        if skipped:
+            logger.warning(
+                f'[SonoReasonDD] mask_visual_features skipped {skipped}/{len(data)} '
+                'rows without an embedded mask')
+        data = data.loc[has_mask].reset_index(drop=True)
+        if data.empty:
+            raise ValueError('No rows with embedded masks remain in the DD dataset')
+
+        aligned_rows = []
+        mismatched_examples = []
+        for row_index, source in data.iterrows():
+            image_size = _encoded_image_size(source['img_data'])
+            mask_size = _encoded_image_size(source['mask'])
+            if image_size == mask_size:
+                aligned_rows.append(row_index)
+            elif len(mismatched_examples) < 10:
+                mismatched_examples.append(
+                    f"patient_id={source.get('patient_id')!r}: "
+                    f'image={image_size}, mask={mask_size}')
+        mismatched_count = len(data) - len(aligned_rows)
+        if mismatched_count:
+            logger.warning(
+                f'[SonoReasonDD] mask_visual_features excluded {mismatched_count}/'
+                f'{len(data)} rows whose image and mask dimensions differ. '
+                f'Examples: {"; ".join(mismatched_examples)}')
+        data = data.iloc[aligned_rows].reset_index(drop=True)
+        if data.empty:
+            raise ValueError(
+                'No spatially aligned image-mask pairs remain in the DD dataset')
+
+        raw_source_limit = os.environ.get(
+            'SONOREASON_SOURCE_IMAGE_LIMIT', '').strip()
+        if raw_source_limit:
+            try:
+                source_limit = int(raw_source_limit)
+            except ValueError as exc:
+                raise ValueError(
+                    'SONOREASON_SOURCE_IMAGE_LIMIT must be an integer, got '
+                    f'{raw_source_limit!r}') from exc
+            if source_limit < 0:
+                raise ValueError(
+                    'SONOREASON_SOURCE_IMAGE_LIMIT must be non-negative')
+            if source_limit > 0:
+                data = data.head(source_limit).reset_index(drop=True)
                 logger.warning(
-                    f'[SonoReasonDD] {limit_name} set but {stratify_on!r} is not a '
-                    f'column; falling back to an unstratified head({n}).')
-            out = df.head(n).reset_index(drop=True)
-        else:
-            groups = list(df.groupby(stratify_on, sort=True, dropna=False))
-            per_class, remainder = divmod(n, len(groups))
-            parts = []
-            for offset, (_, group) in enumerate(groups):
-                take = per_class + (offset < remainder)
-                if take:
-                    parts.append(group.head(take))
-            out = pd.concat(parts).sort_index().reset_index(drop=True)
-        logger.warning(
-            f'[SonoReasonDD] {limit_name}={n} -> {len(out)} rows. SMOKE TEST: '
-            f'this is a format check, the metrics below are not results.')
-        return out
+                    f'[SonoReasonDD] mask_visual_features limited to '
+                    f'{len(data)} source images before per-feature expansion')
+
+        target_file = Path(os.environ.get(
+            'SONOREASON_ANATOMY_TARGETS_FILE',
+            Path(os.environ.get('LMUData', os.path.expanduser('~/LMUData')))
+            / 'anatomy_targets.json',
+        ))
+        if not target_file.is_file():
+            raise FileNotFoundError(
+                f'Anatomy-target mapping not found: {target_file}')
+        target_payload = json.loads(target_file.read_text())
+        target_by_anatomy = target_payload.get(
+            'anatomy_to_segmentation_target')
+        if not isinstance(target_by_anatomy, dict) or not target_by_anatomy:
+            raise ValueError(
+                f'Invalid anatomy-target mapping in {target_file}')
+        rows = []
+        for source_index, source in data.iterrows():
+            anatomy = str(source['anatomy_location']).strip().lower() or 'specified anatomy'
+            if anatomy not in target_by_anatomy:
+                raise ValueError(
+                    f'No segmentation target configured for anatomy {anatomy!r} '
+                    f'in {target_file}')
+            target = str(target_by_anatomy[anatomy]).strip()
+            if not target:
+                raise ValueError(
+                    f'Empty segmentation target for anatomy {anatomy!r} '
+                    f'in {target_file}')
+            primary_image_index = f'{source_index}__shape'
+            for feature in measurement_features:
+                feature_question = load_prompt_file('mask_visual_features.txt').format(
+                    anatomy=anatomy,
+                    segmentation_target=target,
+                    feature_name=feature,
+                    feature_prompt=prompts[feature],
+                )
+                row = {
+                    'index': f'{source_index}__{feature}',
+                    'source_index': source_index,
+                    'patient_id': _json_scalar(source.get('patient_id')),
+                    'dataset_name': _json_scalar(source.get('dataset_name')),
+                    'anatomy_location': anatomy,
+                    'segmentation_target': target,
+                    'feature': feature,
+                    # Store the aligned pair once; subsequent feature rows use
+                    # VLMEvalKit's short-index image reference mechanism.
+                    # ImageBaseDataset expects multi-image values in its
+                    # serialized-list form.  Supplying a raw list here makes
+                    # pandas materialize a NumPy array, for which pd.isna(x)
+                    # has an ambiguous truth value during base initialization.
+                    'image': (
+                        repr([source['img_data'], source['mask']])
+                        if feature == 'shape' else primary_image_index),
+                    # Every feature row refers to the same source image-mask
+                    # pair.  Stable shared paths let dump_image decode that
+                    # pair once instead of writing six byte-identical copies.
+                    'image_path': repr([
+                        f'{source_index}__image.png',
+                        f'{source_index}__mask.png',
+                    ]),
+                    'question': feature_question,
+                    'answer': '',
+                    'ground_truth_measurements': json.dumps({
+                        target_name: _json_scalar(source.get(column))
+                        for target_name, column in MASK_MEASUREMENT_COLUMNS[feature].items()
+                        if _json_scalar(source.get(column)) is not None
+                    }),
+                    'ground_truth_thresholds': '{}',
+                }
+                rows.append(row)
+        return pd.DataFrame(rows)
 
     def load_data(self, dataset):
         data_root = os.environ.get('LMUData', os.path.expanduser('~/LMUData'))
@@ -589,14 +758,15 @@ class SonoReasonDD(ImageBaseDataset):
         strategy = canonical_strategy()
         df = pd.read_csv(path, sep='\t')
         if strategy == 'segmentation':
-            return self._apply_limit(
-                self._build_segmentation_data(df), stratify_on=None)
-        if strategy == 'feature':
-            # Eligibility and limiting run before the seven-row feature
-            # expansion, so a configured limit always counts source images.
-            df = _feature_eligible(df)
-            df = self._apply_limit(df, stratify_on='class_label')
-            return self._build_feature_data(df)
+            return self._apply_sample_limit(self._build_segmentation_data(df))
+        if strategy == 'mask_visual_features':
+            return self._apply_sample_limit(self._build_mask_measurement_data(df))
+        if strategy in {'feature', 'mask_plus_features'}:
+            return self._apply_sample_limit(self._build_feature_data(
+                df,
+                with_candidate_mask=strategy == 'mask_plus_features',
+                qualitative_mask_prompt=strategy == 'mask_visual_features',
+            ))
 
         # Two TSV shapes are in play: the published SonoReason schema read
         # straight from u2_ext_data/data/DD/ (img_data/direct_prompt/class_label),
@@ -619,7 +789,32 @@ class SonoReasonDD(ImageBaseDataset):
             })
             df['index'] = range(len(df))
 
-        return self._apply_limit(df)
+        # SONOREASON_LIMIT=<n> cuts the run down to a smoke test: enough rows to
+        # tell whether the output format parses at all, cheap enough to turn
+        # around in minutes. Sampling is stratified by `answer` and seeded, so
+        # every class is represented (a plain head(n) on these files can return
+        # a single class) and two models see byte-identical rows.
+        #
+        # A smoke run is a format check, never a result: n is far too small for
+        # the per-class metrics to mean anything.
+        limit = os.environ.get('SONOREASON_LIMIT')
+        if limit:
+            n = int(limit)
+            if n < len(df):
+                n_classes = max(1, df['answer'].nunique())
+                per_class = max(1, n // n_classes)
+                # groupby().head() keeps the file's original row order and does
+                # not touch the `index` column VLMEvalKit keys its cache on.
+                df = (df.groupby('answer', sort=True)
+                        .head(per_class)
+                        .sort_index()
+                        .reset_index(drop=True))
+                logger.warning(
+                    f'[SonoReasonDD] SONOREASON_LIMIT={n} -> {len(df)} rows '
+                    f'({per_class} x {n_classes} classes). SMOKE TEST: this is a '
+                    f'format check, the metrics below are not results.'
+                )
+        return self._apply_sample_limit(df)
 
     def build_prompt(self, line):
         if isinstance(line, int):
@@ -630,6 +825,12 @@ class SonoReasonDD(ImageBaseDataset):
             msgs += [dict(type='image', value=p) for p in tgt]
         else:
             msgs.append(dict(type='image', value=tgt))
+
+        if 'candidate_mask_path' in line.index:
+            mask_path = str(line['candidate_mask_path'])
+            if not os.path.isfile(mask_path):
+                raise FileNotFoundError(f'Candidate mask not found: {mask_path}')
+            msgs.append(dict(type='image', value=mask_path))
 
         # The feature arm builds a distinct per-feature prompt per row in
         # load_data. sonoreason_dd_breast has a template registered below, so
@@ -648,33 +849,21 @@ class SonoReasonDD(ImageBaseDataset):
 
         prompt_strategy = canonical_strategy()
         meta = DATASET_PROMPT_METADATA.get(self.dataset_name)
-        if meta is not None:
-            # Both arms are built from the same template so the two conditions
-            # differ ONLY in reasoning format, never in the option list.
-            #
-            # This previously read line['question'] for zero_shot, which comes
-            # from the upstream `direct_prompt` column. For the 6 malignancy
-            # datasets that column is byte-identical to the template, but for
-            # the two BI-RADS sets it is *swapped*: bus_cot_birads has
-            # fine-grained ground truth (2/3/4A/4B/4C/5) while its question
-            # column offered only coarse ['2','3','4','5'] -- making every
-            # 4A/4B/4C row unwinnable -- and busbra_birads had the mirror
-            # problem. That asymmetry, not reasoning, is what produced the
-            # apparent reasoning "wins" on exactly those two datasets.
+        if prompt_strategy == 'structured' and meta is not None:
+            # Only the structured arm is defined by the local prompt registry.
+            # zero_shot and reasoning preserve the prompts supplied by the
+            # dataset's direct_prompt and reasoning_prompt columns respectively.
             _, template = resolve_prompt_template(
                 keywords=meta.get('keywords', []),
                 modality=meta.get('modality', ''),
                 anatomy=meta.get('anatomy', ''),
             )
             variants = build_prompt_variants(template)
-            text = variants.get(f'{prompt_strategy}_prompt', variants['direct_prompt'])
+            text = variants['structured_prompt']
         else:
-            # No template registered for this dataset -- fall back to the TSV.
-            logger.warning(
-                f'[SonoReasonDD] no prompt template registered for {self.dataset_name}; '
-                f'falling back to the TSV question column (prompt_strategy={prompt_strategy} '
-                f'will have no effect)'
-            )
+            # load_data maps direct_prompt -> question for zero_shot and
+            # reasoning_prompt -> question for reasoning. Feature and
+            # segmentation rows return through the guard above.
             text = line['question']
 
         if not self._prompt_logged:
@@ -693,37 +882,75 @@ class SonoReasonDD(ImageBaseDataset):
 
     @staticmethod
     def _parse_feature_prediction(value):
+        text = str(value).strip()
+        # Reasoning-tuned models such as MedVLM-R1 may wrap the requested JSON
+        # in <think>/<answer> tags. Parse only the outermost JSON object when
+        # one is present, while preserving json_repair for malformed JSON.
+        object_start = text.find('{')
+        object_end = text.rfind('}')
+        if object_start >= 0 and object_end > object_start:
+            text = text[object_start:object_end + 1]
         try:
-            parsed = load_json_repair(str(value))
+            parsed = load_json_repair(text)
         except Exception:
             return None
         return parsed if isinstance(parsed, dict) else None
 
     def _evaluate_features(self, data, eval_file):
+        expects_feature_label = canonical_strategy() != 'mask_visual_features'
+        expects_diagnosis = canonical_strategy() != 'mask_visual_features'
         parsed_labels = []
+        parsed_diagnoses = []
+        diagnosis_hits = []
         parse_ok = []
         hits = []
         row_maes = []
         row_measurement_counts = []
         measurement_records = []
+        measurement_outputs = []
+        source_rows = {
+            str(source['index']): source for _, source in self.data.iterrows()
+        }
+        dataset_tsv_path = str(Path(
+            os.environ.get('LMUData', os.path.expanduser('~/LMUData'))
+        ) / os.environ.get(
+            'SONOREASON_DATASET_FILE', f'{self.dataset_name}.tsv'))
 
         for _, row in data.iterrows():
             parsed = self._parse_feature_prediction(row['prediction'])
             valid = parsed is not None
             predicted_label = parsed.get('label') if valid else None
+            predicted_diagnosis = parsed.get('diagnosis') if valid else None
             parsed_labels.append(predicted_label)
+            parsed_diagnoses.append(predicted_diagnosis)
             parse_ok.append(valid)
             hits.append(
-                valid
+                None if not expects_feature_label else valid
                 and self._normalize_label(predicted_label)
                 == self._normalize_label(row['answer'])
+            )
+            diagnosis_answer = row.get('diagnosis_answer')
+            diagnosis_hits.append(
+                None if not expects_diagnosis else valid
+                and diagnosis_answer is not None
+                and self._normalize_label(predicted_diagnosis)
+                == self._normalize_label(diagnosis_answer)
             )
 
             truth = json.loads(row['ground_truth_measurements'])
             predicted_measurements = parsed.get('measurements', {}) if valid else {}
             if not isinstance(predicted_measurements, dict):
                 predicted_measurements = {}
+            if row['feature'] == 'margin':
+                try:
+                    predicted_measurements['boundary_contrast_proxy'] = abs(
+                        float(predicted_measurements['outer_border_median'])
+                        - float(predicted_measurements['inner_border_median'])
+                    )
+                except (KeyError, TypeError, ValueError):
+                    pass
             errors = []
+            absolute_errors = {}
             for measurement, target in truth.items():
                 predicted = predicted_measurements.get(measurement)
                 try:
@@ -731,6 +958,7 @@ class SonoReasonDD(ImageBaseDataset):
                 except (TypeError, ValueError):
                     continue
                 errors.append(error)
+                absolute_errors[measurement] = error
                 measurement_records.append({
                     'feature': row['feature'],
                     'measurement': measurement,
@@ -739,36 +967,92 @@ class SonoReasonDD(ImageBaseDataset):
             row_maes.append(sum(errors) / len(errors) if errors else None)
             row_measurement_counts.append(len(errors))
 
+            image_paths = []
+            source_index = _json_scalar(row.get('source_index'))
+            shared_paths = [
+                Path(self.img_root) / f'{source_index}__image.png',
+                Path(self.img_root) / f'{source_index}__mask.png',
+            ]
+            legacy_paths = [
+                Path(self.img_root) / f"{row['index']}_0.png",
+                Path(self.img_root) / f"{row['index']}_1.png",
+            ]
+            if all(path.is_file() for path in shared_paths):
+                image_paths = [str(path) for path in shared_paths]
+            elif all(path.is_file() for path in legacy_paths):
+                image_paths = [str(path) for path in legacy_paths]
+            source = source_rows.get(str(row['index']))
+            if not image_paths and source is not None and (
+                    'image' in source.index or 'image_path' in source.index):
+                dumped = self.dump_image(source)
+                image_paths = dumped if isinstance(dumped, list) else [dumped]
+            measurement_outputs.append({
+                'index': str(row['index']),
+                'source_index': source_index,
+                'patient_id': _json_scalar(row.get('patient_id')),
+                'dataset_name': _json_scalar(row.get('dataset_name')),
+                'dataset_tsv_path': dataset_tsv_path,
+                'feature': str(row['feature']),
+                'original_image_path': image_paths[0] if image_paths else None,
+                'mask_path': image_paths[1] if len(image_paths) > 1 else None,
+                'ground_truth_measurements': truth,
+                'predicted_measurements': predicted_measurements,
+                'reasoning': parsed.get('reasoning') if valid else None,
+                'raw_model_output': str(row['prediction']),
+                'parse_ok': valid,
+                'absolute_errors': absolute_errors,
+                'measurement_mae': (
+                    sum(errors) / len(errors) if errors else None),
+                'measurement_n': len(errors),
+            })
+
         data['predicted_label'] = parsed_labels
+        data['predicted_diagnosis'] = parsed_diagnoses
+        data['diagnosis_hit'] = diagnosis_hits
         data['prediction_parse_ok'] = parse_ok
         data['hit'] = hits
         data['measurement_mae'] = row_maes
         data['measurement_n'] = row_measurement_counts
         dump(data, eval_file.replace('.xlsx', '_parsed.xlsx'))
+        if not expects_feature_label:
+            dump(
+                measurement_outputs,
+                eval_file.replace('.xlsx', '_measurement_records.json'),
+            )
 
         details = pd.DataFrame(measurement_records)
         metric_rows = []
         for feature, group in data.groupby('feature', sort=False):
             feature_errors = details[details['feature'] == feature] if len(details) else details
-            metric_rows.append({
+            metric_row = {
                 'feature': feature,
-                'label_accuracy': group['hit'].mean(),
                 'json_parse_rate': group['prediction_parse_ok'].mean(),
                 'measurement_mae': (
                     feature_errors['absolute_error'].mean() if len(feature_errors) else None),
                 'measurement_n': len(feature_errors),
                 'n': len(group),
-            })
-        metric_rows.append({
+            }
+            if expects_feature_label:
+                metric_row['label_accuracy'] = group['hit'].mean()
+            if expects_diagnosis and 'diagnosis_answer' in group.columns:
+                metric_row['diagnosis_accuracy'] = group['diagnosis_hit'].mean()
+            metric_rows.append(metric_row)
+        overall_row = {
             'feature': 'overall',
-            'label_accuracy': data['hit'].mean(),
             'json_parse_rate': data['prediction_parse_ok'].mean(),
             'measurement_mae': details['absolute_error'].mean() if len(details) else None,
             'measurement_n': len(details),
             'n': len(data),
-        })
+        }
+        if expects_feature_label:
+            overall_row['label_accuracy'] = data['hit'].mean()
+        if expects_diagnosis and 'diagnosis_answer' in data.columns:
+            overall_row['diagnosis_accuracy'] = data['diagnosis_hit'].mean()
+        metric_rows.append(overall_row)
         metrics = pd.DataFrame(metric_rows)
-        dump(metrics, eval_file.replace('.xlsx', '_acc.csv'))
+        summary_suffix = (
+            '_acc.csv' if expects_feature_label else '_measurement_summary.csv')
+        dump(metrics, eval_file.replace('.xlsx', summary_suffix))
         if len(details):
             measurement_metrics = details.groupby(
                 ['feature', 'measurement'], as_index=False)['absolute_error'].agg(['mean', 'count'])
@@ -921,7 +1205,6 @@ class SonoReasonDD(ImageBaseDataset):
                         'predicted_bbox': json.dumps(bbox),
                         'agent_accepted': agent_result.get('accepted'),
                         'agent_attempts': agent_result.get('attempts'),
-                        'verification_error': agent_result.get('verification_error'),
                         'vlm_backend': agent_result.get('vlm_backend'),
                         'vlm_model': agent_result.get('vlm_model'),
                     })
@@ -978,7 +1261,6 @@ class SonoReasonDD(ImageBaseDataset):
 
     def evaluate(self, eval_file, **kwargs):
         data = load(eval_file)
-        _assert_predictions_present(data, eval_file)
         if 'feature' in data.columns and data['feature'].eq('segmentation').all():
             return self._evaluate_segmentation(data, eval_file)
         if 'feature' in data.columns:

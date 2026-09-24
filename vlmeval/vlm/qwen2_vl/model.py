@@ -321,8 +321,9 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
             torch.cuda.set_device(0)
             self.device = 'cuda'
         else:
+            attn_implementation = kwargs.get('attn_implementation', 'flash_attention_2')
             model_kwargs = dict(
-                torch_dtype='auto', device_map="auto", attn_implementation='flash_attention_2'
+                torch_dtype='auto', device_map="auto", attn_implementation=attn_implementation
             )
             if model_config is not None:
                 model_kwargs['config'] = model_config

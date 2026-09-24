@@ -1,4 +1,4 @@
-git import copy as cp
+import copy as cp
 import os
 from functools import partial
 
@@ -2000,6 +2000,7 @@ qwen2vl_series = {
         model_path="Qwen/Qwen2.5-VL-7B-Instruct",
         min_pixels=1280 * 28 * 28,
         max_pixels=16384 * 28 * 28,
+        attn_implementation="sdpa",
         use_custom_prompt=False,
     ),
     "Qwen2.5-VL-7B-Instruct-ForVideo": partial(
