@@ -246,6 +246,7 @@ class SonoReasonSegmentationAgent(BaseModel):
             if bbox is None:
                 return json.dumps({'status': 'skipped_invalid_bbox', 'bbox': None})
             accepted = False
+            verification_error = None
             for attempt in range(self.max_refinements + 1):
                 mask, confidence = self._segment(image, bbox)
                 overlay = self._overlay(image, mask, bbox)
@@ -285,6 +286,7 @@ class SonoReasonSegmentationAgent(BaseModel):
             'accepted': accepted, 'attempts': attempts,
             'verification_error': verification_error,
             'segmentor_confidence': confidence if attempts else None,
+            'verification_error': verification_error if attempts else None,
             'vlm_backend': self.backend, 'vlm_model': self.vlm_model_name,
             'segmentor_model': self.segmentor_model,
         })

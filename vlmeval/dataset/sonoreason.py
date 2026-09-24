@@ -312,6 +312,63 @@ def _json_scalar(value):
     return value
 
 
+def _feature_eligible(df):
+    """Rows the feature arm can actually build a question from.
+
+    Two filters, both of which _build_feature_data would otherwise apply after
+    the smoke limit had already been taken -- which makes the limit mean
+    "n rows sampled" rather than "n images evaluated". bus_uclm carries
+    descriptor labels for only a fraction of its rows, so a nominal 100-image
+    cell silently came out at 33 while every other dataset got 100. Cells of
+    different sizes are not comparable, and the shortfall is invisible in the
+    result file.
+
+    Applying them up front also means the limit's class stratification is
+    computed over the rows that survive, not over rows that are about to be
+    discarded.
+    """
+    n0 = len(df)
+    if 'anatomy_location' in df.columns:
+        df = df[df['anatomy_location'].astype(str).str.lower().eq('breast')]
+    label_cols = [spec['label'] for spec in FEATURE_SPECS.values()
+                  if spec['label'] in df.columns]
+    if label_cols:
+        # An image with no descriptor label at all contributes zero rows to the
+        # expansion; one with some labels still contributes those.
+        df = df[df[label_cols].notna().any(axis=1)]
+    df = df.reset_index(drop=True)
+    if len(df) < n0:
+        logger.info(
+            f'[SonoReasonDD] feature arm: {len(df)}/{n0} rows are eligible '
+            f'(breast, with at least one descriptor label).')
+    return df
+
+
+def _assert_predictions_present(data, eval_file):
+    """Fail loudly when the prediction column is empty.
+
+    Job 56143146 wrote an all-null prediction column, scored every metric 0.0,
+    and reported status "done" with infer_fail_rate 0.00% -- a result file that
+    looks like a finished experiment whose real content is "inference never
+    ran". A run that produced no text at all is an infrastructure failure and
+    must not be scoreable: 0.0 accuracy is a claim about a model, and this is
+    not one.
+    """
+    if 'prediction' not in data.columns:
+        raise ValueError(
+            f'{eval_file} has no prediction column -- inference did not run.')
+    n_null = int(data['prediction'].isna().sum())
+    if n_null == len(data):
+        raise ValueError(
+            f'{eval_file}: all {len(data)} predictions are null -- inference did '
+            f'not run. Refusing to score this as 0.0; check the inference log '
+            f'for the model load or the generation step failing.')
+    if n_null:
+        logger.warning(
+            f'[SonoReasonDD] {n_null}/{len(data)} predictions are null (inference '
+            f'produced nothing for those rows); they are scored as failures.')
+
+
 class SonoReasonDD(ImageBaseDataset):
     TYPE = 'VQA'
     # local TSVs in LMUData -- no MD5/URL since these aren't hosted the way
@@ -404,21 +461,26 @@ class SonoReasonDD(ImageBaseDataset):
         return pd.DataFrame(rows)
 
     @staticmethod
-    def _apply_sample_limit(data):
-        raw_limit = os.environ.get('SONOREASON_SAMPLE_LIMIT', '').strip()
-        if not raw_limit:
-            return data
-        try:
-            limit = int(raw_limit)
-        except ValueError as exc:
-            raise ValueError(
-                f'SONOREASON_SAMPLE_LIMIT must be an integer, got {raw_limit!r}'
-            ) from exc
-        if limit < 0:
-            raise ValueError('SONOREASON_SAMPLE_LIMIT must be non-negative')
-        if limit == 0:
-            return data
-        return data.head(limit).reset_index(drop=True)
+    def _configured_limit():
+        """Resolve the legacy and API/segmentation limit variables as one setting."""
+        values = {}
+        for name in ('SONOREASON_LIMIT', 'SONOREASON_SAMPLE_LIMIT'):
+            raw = os.environ.get(name, '').strip()
+            if not raw:
+                continue
+            try:
+                value = int(raw)
+            except ValueError as exc:
+                raise ValueError(f'{name} must be an integer, got {raw!r}') from exc
+            if value < 0:
+                raise ValueError(f'{name} must be non-negative')
+            values[name] = value
+        if not values:
+            return None, None
+        if len(set(values.values())) > 1:
+            rendered = ', '.join(f'{name}={value}' for name, value in values.items())
+            raise ValueError(f'Conflicting SonoReason sample limits: {rendered}')
+        return '/'.join(values), next(iter(values.values()))
 
     def _build_feature_data(self, data):
         prompt_file = os.environ.get('SONOREASON_FEATURE_PROMPTS_FILE')
@@ -427,7 +489,12 @@ class SonoReasonDD(ImageBaseDataset):
                 'feature_diagnosis requires SONOREASON_FEATURE_PROMPTS_FILE')
         prompts = _load_feature_prompts(prompt_file)
 
-        required = {'img_data', 'anatomy_location', 'bbox'}
+        # `bbox` is deliberately NOT required: it only supplies
+        # bounding_box_width/height for posterior_feature, the one consumer
+        # already tolerates its absence via try/except, and requiring it locks
+        # out bus_uc / bus_uclm / open_access_breast, which carry all seven
+        # labels and every measurement column but no bbox.
+        required = {'img_data', 'anatomy_location'}
         for spec in FEATURE_SPECS.values():
             required.add(spec['label'])
             required.update(spec['measurements'].values())
@@ -442,7 +509,6 @@ class SonoReasonDD(ImageBaseDataset):
         ].reset_index(drop=True)
         rows = []
         for source_index, source in data.iterrows():
-            primary_image_index = f'{source_index}__shape'
             for feature, spec in FEATURE_SPECS.items():
                 label = _json_scalar(source[spec['label']])
                 if label is None:
@@ -452,7 +518,7 @@ class SonoReasonDD(ImageBaseDataset):
                     for target, column in spec['measurements'].items()
                     if _json_scalar(source[column]) is not None
                 }
-                if feature == 'posterior_feature':
+                if feature == 'posterior_feature' and 'bbox' in source.index:
                     try:
                         _, _, width, height = ast.literal_eval(str(source['bbox']))
                         measurements['bounding_box_width'] = _json_scalar(width)
@@ -471,10 +537,10 @@ class SonoReasonDD(ImageBaseDataset):
                     'dataset_name': _json_scalar(source.get('dataset_name')),
                     'anatomy_location': 'breast',
                     'feature': feature,
-                    # Store base64 once per source image. Other feature rows use
-                    # VLMEvalKit's short-index image reference mechanism.
-                    'image': (
-                        source['img_data'] if feature == 'shape' else primary_image_index),
+                    # Each expanded row must remain self-contained. ImageBaseDataset
+                    # treats every string in `image` as base64; it has no row-reference
+                    # mechanism, and warm image caches previously hid that failure.
+                    'image': source['img_data'],
                     'question': prompts[feature],
                     'answer': str(label),
                     'ground_truth_measurements': json.dumps(measurements),
@@ -483,6 +549,31 @@ class SonoReasonDD(ImageBaseDataset):
         if not rows:
             raise ValueError('No labeled breast rows are available for feature_diagnosis')
         return pd.DataFrame(rows)
+
+    def _apply_limit(self, df, stratify_on='answer'):
+        """Apply either supported smoke/API limit, optionally stratified."""
+        limit_name, n = self._configured_limit()
+        if n in (None, 0) or n >= len(df):
+            return df
+        if stratify_on is None or stratify_on not in df.columns:
+            if stratify_on is not None:
+                logger.warning(
+                    f'[SonoReasonDD] {limit_name} set but {stratify_on!r} is not a '
+                    f'column; falling back to an unstratified head({n}).')
+            out = df.head(n).reset_index(drop=True)
+        else:
+            groups = list(df.groupby(stratify_on, sort=True, dropna=False))
+            per_class, remainder = divmod(n, len(groups))
+            parts = []
+            for offset, (_, group) in enumerate(groups):
+                take = per_class + (offset < remainder)
+                if take:
+                    parts.append(group.head(take))
+            out = pd.concat(parts).sort_index().reset_index(drop=True)
+        logger.warning(
+            f'[SonoReasonDD] {limit_name}={n} -> {len(out)} rows. SMOKE TEST: '
+            f'this is a format check, the metrics below are not results.')
+        return out
 
     def load_data(self, dataset):
         data_root = os.environ.get('LMUData', os.path.expanduser('~/LMUData'))
@@ -498,9 +589,14 @@ class SonoReasonDD(ImageBaseDataset):
         strategy = canonical_strategy()
         df = pd.read_csv(path, sep='\t')
         if strategy == 'segmentation':
-            return self._apply_sample_limit(self._build_segmentation_data(df))
+            return self._apply_limit(
+                self._build_segmentation_data(df), stratify_on=None)
         if strategy == 'feature':
-            return self._apply_sample_limit(self._build_feature_data(df))
+            # Eligibility and limiting run before the seven-row feature
+            # expansion, so a configured limit always counts source images.
+            df = _feature_eligible(df)
+            df = self._apply_limit(df, stratify_on='class_label')
+            return self._build_feature_data(df)
 
         # Two TSV shapes are in play: the published SonoReason schema read
         # straight from u2_ext_data/data/DD/ (img_data/direct_prompt/class_label),
@@ -523,32 +619,7 @@ class SonoReasonDD(ImageBaseDataset):
             })
             df['index'] = range(len(df))
 
-        # SONOREASON_LIMIT=<n> cuts the run down to a smoke test: enough rows to
-        # tell whether the output format parses at all, cheap enough to turn
-        # around in minutes. Sampling is stratified by `answer` and seeded, so
-        # every class is represented (a plain head(n) on these files can return
-        # a single class) and two models see byte-identical rows.
-        #
-        # A smoke run is a format check, never a result: n is far too small for
-        # the per-class metrics to mean anything.
-        limit = os.environ.get('SONOREASON_LIMIT')
-        if limit:
-            n = int(limit)
-            if n < len(df):
-                n_classes = max(1, df['answer'].nunique())
-                per_class = max(1, n // n_classes)
-                # groupby().head() keeps the file's original row order and does
-                # not touch the `index` column VLMEvalKit keys its cache on.
-                df = (df.groupby('answer', sort=True)
-                        .head(per_class)
-                        .sort_index()
-                        .reset_index(drop=True))
-                logger.warning(
-                    f'[SonoReasonDD] SONOREASON_LIMIT={n} -> {len(df)} rows '
-                    f'({per_class} x {n_classes} classes). SMOKE TEST: this is a '
-                    f'format check, the metrics below are not results.'
-                )
-        return self._apply_sample_limit(df)
+        return self._apply_limit(df)
 
     def build_prompt(self, line):
         if isinstance(line, int):
@@ -850,6 +921,7 @@ class SonoReasonDD(ImageBaseDataset):
                         'predicted_bbox': json.dumps(bbox),
                         'agent_accepted': agent_result.get('accepted'),
                         'agent_attempts': agent_result.get('attempts'),
+                        'verification_error': agent_result.get('verification_error'),
                         'vlm_backend': agent_result.get('vlm_backend'),
                         'vlm_model': agent_result.get('vlm_model'),
                     })
@@ -906,6 +978,7 @@ class SonoReasonDD(ImageBaseDataset):
 
     def evaluate(self, eval_file, **kwargs):
         data = load(eval_file)
+        _assert_predictions_present(data, eval_file)
         if 'feature' in data.columns and data['feature'].eq('segmentation').all():
             return self._evaluate_segmentation(data, eval_file)
         if 'feature' in data.columns:

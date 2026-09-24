@@ -3,7 +3,7 @@ import os
 import torch
 from PIL import Image
 from .base import BaseModel
-from .sonoreason_gen import default_gen_kwargs
+from .sonoreason_gen import apply_prefill, default_gen_kwargs, resolve_prefill
 
 # Gemma's thought-channel delimiters, as used by MedGemma-1.5. Both are
 # registered with special=False in tokenizer_config.json, so decoding with
@@ -48,6 +48,10 @@ class MedGemma(BaseModel):
         # parse-failure rate on every reasoning run.
         self.gen_kwargs = default_gen_kwargs(tokenizer=self.processor.tokenizer, **kwargs)
         self.think_prefill_ids = self._resolve_think_prefill()
+        # Composed after the thought-channel closer: '<unused95>' ends the
+        # trace, '{' then opens the object. Order matters -- a brace before
+        # the closer would land inside the trace and be stripped with it.
+        self.prefill_ids, self.prefill_text = resolve_prefill(self.processor.tokenizer)
 
     def _resolve_think_prefill(self):
         """Token ids to append after the generation prompt, or [] to disable.
@@ -87,18 +91,16 @@ class MedGemma(BaseModel):
             return_dict=True, return_tensors='pt'
         ).to(self.model.device, dtype=torch.bfloat16)
 
-        if self.think_prefill_ids:
-            ids = inputs['input_ids']
-            pre = torch.tensor([self.think_prefill_ids],
-                               device=ids.device, dtype=ids.dtype)
-            inputs['input_ids'] = torch.cat([ids, pre], dim=-1)
-            if 'attention_mask' in inputs:
-                inputs['attention_mask'] = torch.cat(
-                    [inputs['attention_mask'], torch.ones_like(pre)], dim=-1)
-
-        # Computed after the prefill so the slice below drops it: the prefill is
-        # scaffolding we supplied, not something the model produced.
+        # in_len is recomputed after each prefill so the slice below drops both:
+        # they are scaffolding we supplied, not something the model produced.
+        # The JSON prefill is the exception -- it is the first character of the
+        # answer, so it is added back onto the decoded text.
         in_len = inputs['input_ids'].shape[-1]
+        if self.think_prefill_ids:
+            in_len = apply_prefill(inputs, self.think_prefill_ids)
+        if self.prefill_ids:
+            in_len = apply_prefill(inputs, self.prefill_ids)
         with torch.inference_mode():
             out = self.model.generate(**inputs, **self.gen_kwargs)
-        return self.processor.decode(out[0][in_len:], skip_special_tokens=True).strip()
+        text = self.processor.decode(out[0][in_len:], skip_special_tokens=True)
+        return (self.prefill_text + text).strip()
