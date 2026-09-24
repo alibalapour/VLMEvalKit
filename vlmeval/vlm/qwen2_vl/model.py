@@ -243,6 +243,7 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
             cfg = json.load(f)
             architectures = str(cfg.get("architectures", None)).lower()
 
+        model_config = None
         if listinstr(['omni'], architectures):
             try:
                 from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
@@ -258,9 +259,21 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
             self.processor = AutoProcessor.from_pretrained(self.model_path)
 
         else:
-            from transformers import Qwen2VLForConditionalGeneration, Qwen2VLProcessor
+            from transformers import Qwen2VLConfig, Qwen2VLForConditionalGeneration, Qwen2VLProcessor
             MODEL_CLS = Qwen2VLForConditionalGeneration
-            self.processor = Qwen2VLProcessor.from_pretrained(self.model_path)
+            text_config = cfg.get('text_config') or {}
+            if cfg.get('use_cache') is None or text_config.get('use_cache') is None:
+                # Transformers 5 validates these legacy nullable fields as
+                # strict booleans (for example, JZPeterPan/MedVLM-R1).
+                cfg = dict(cfg)
+                cfg['use_cache'] = True
+                cfg['text_config'] = dict(text_config)
+                cfg['text_config']['use_cache'] = True
+                model_config = Qwen2VLConfig(**cfg)
+            processor_kwargs = {}
+            if model_config is not None:
+                processor_kwargs['config'] = model_config
+            self.processor = Qwen2VLProcessor.from_pretrained(self.model_path, **processor_kwargs)
 
         gpu_mems = get_gpu_memory()
         max_gpu_mem = max(gpu_mems) if gpu_mems != [] else -1
@@ -308,9 +321,12 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
             torch.cuda.set_device(0)
             self.device = 'cuda'
         else:
-            self.model = MODEL_CLS.from_pretrained(
-                model_path, torch_dtype='auto', device_map="auto", attn_implementation='flash_attention_2'
+            model_kwargs = dict(
+                torch_dtype='auto', device_map="auto", attn_implementation='flash_attention_2'
             )
+            if model_config is not None:
+                model_kwargs['config'] = model_config
+            self.model = MODEL_CLS.from_pretrained(model_path, **model_kwargs)
             self.model.eval()
 
         torch.cuda.empty_cache()

@@ -1,4 +1,4 @@
-import copy as cp
+git import copy as cp
 import os
 from functools import partial
 
@@ -2619,6 +2619,13 @@ supported_VLM = {
 'MedGemma-4B': partial(vlm.MedGemma, model_path='google/medgemma-4b-it'),
 'MedGemma-1.5-4B': partial(vlm.MedGemma, model_path='google/medgemma-1.5-4b-it'),
 'SonoReason-Segmentation-Agent': partial(vlm.SonoReasonSegmentationAgent),
+'MedVLM-R1': partial(
+    vlm.Qwen2VLChat,
+    model_path='JZPeterPan/MedVLM-R1',
+    max_new_tokens=1024,
+    do_sample=False,
+    temperature=1.0,
+),
 'Mistral-Small-3.1-24B-Instruct-2503': partial(vlm.MistralSmall, model_path='mistralai/Mistral-Small-3.1-24B-Instruct-2503'),
 'LLaVA-Med-v1.5-Mistral-7B': partial(vlm.LLaVAMed, model_path='chaoyinshe/llava-med-v1.5-mistral-7b-hf'),
 
