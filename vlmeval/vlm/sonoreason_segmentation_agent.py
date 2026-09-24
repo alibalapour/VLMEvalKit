@@ -14,16 +14,43 @@ import requests
 from PIL import Image, ImageDraw
 
 from .base import BaseModel
+from ..dataset.sonoreason_prompts import load_prompt_file
 
 
-VERIFY_PROMPT = """Verify a mask proposed by an external medical image segmentor for
-the exact segmentation target described in the ORIGINAL SEGMENTATION TASK below.
-The first image is the original ultrasound and the second is an overlay: green is the
-proposed mask and red is its prompting box. Accept only if green covers the complete
-visible target tissue. Reject posterior acoustic shadowing beneath the target, normal
-tissue, labels, or artifacts. Calipers may be localization clues. Return only JSON:
-{"accept": true, "bbox": [x_min, y_min, x_max, y_max], "reason": "short reason"}
-If incorrect, set accept=false and provide a corrected pixel-coordinate bbox."""
+class _QwenLocalVLM:
+    """Minimal Qwen2.5-VL runner for local segmentation-agent turns."""
+
+    def __init__(self, model_name):
+        import torch
+        from transformers import AutoModelForImageTextToText, AutoProcessor
+
+        self.processor = AutoProcessor.from_pretrained(model_name)
+        self.model = AutoModelForImageTextToText.from_pretrained(
+            model_name, dtype=torch.bfloat16, device_map='auto',
+            low_cpu_mem_usage=True).eval()
+
+    def generate_inner(self, message):
+        from qwen_vl_utils import process_vision_info
+
+        content = []
+        for item in message:
+            if item['type'] == 'image':
+                content.append({'type': 'image', 'image': item['value']})
+            elif item['type'] == 'text':
+                content.append({'type': 'text', 'text': item['value']})
+        messages = [{'role': 'user', 'content': content}]
+        text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True)
+        images, videos = process_vision_info(messages)
+        inputs = self.processor(
+            text=[text], images=images, videos=videos, padding=True,
+            return_tensors='pt').to(self.model.device)
+        generated = self.model.generate(
+            **inputs, max_new_tokens=1024, do_sample=False)
+        generated = generated[:, inputs.input_ids.shape[-1]:]
+        return self.processor.batch_decode(
+            generated, skip_special_tokens=True,
+            clean_up_tokenization_spaces=False)[0].strip()
 
 
 class SonoReasonSegmentationAgent(BaseModel):
@@ -42,6 +69,18 @@ class SonoReasonSegmentationAgent(BaseModel):
         self.segmentor_model = os.environ.get(
             'SONOREASON_SEGMENTOR_MODEL', 'wanglab/medsam-vit-base')
         self.segmentor_device = os.environ.get('SONOREASON_SEGMENTOR_DEVICE', 'auto')
+        default_ultrasam_root = (
+            Path(__file__).resolve().parents[3] / 'third_party' / 'UltraSam')
+        self.ultrasam_root = Path(os.environ.get(
+            'SONOREASON_ULTRASAM_ROOT', default_ultrasam_root))
+        self.ultrasam_checkpoint = Path(os.environ.get(
+            'SONOREASON_ULTRASAM_CHECKPOINT',
+            self.ultrasam_root / 'UltraSam.pth'))
+        self.ultrasam_config = Path(os.environ.get(
+            'SONOREASON_ULTRASAM_CONFIG',
+            self.ultrasam_root / 'configs' / 'UltraSAM' / 'UltraSAM_full'
+            / 'UltraSAM_box_refine.py'))
+        self.ultrasam = None
         self.max_refinements = int(os.environ.get('SONOREASON_MAX_REFINEMENTS', '2'))
         self.max_tokens = int(os.environ.get('SONOREASON_VLM_MAX_TOKENS', '12000'))
         self.reasoning_effort = os.environ.get('SONOREASON_REASONING_EFFORT', 'low')
@@ -50,8 +89,11 @@ class SonoReasonSegmentationAgent(BaseModel):
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.local_vlm = None
         if self.backend == 'local':
-            from .medgemma import MedGemma
-            self.local_vlm = MedGemma(model_path=self.vlm_model_name)
+            if 'qoq-med' in self.vlm_model_name.lower():
+                self.local_vlm = _QwenLocalVLM(self.vlm_model_name)
+            else:
+                from .medgemma import MedGemma
+                self.local_vlm = MedGemma(model_path=self.vlm_model_name)
 
     @staticmethod
     def _json(text):
@@ -144,6 +186,17 @@ class SonoReasonSegmentationAgent(BaseModel):
         device = self.segmentor_device
         if device == 'auto':
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        if self.segmentor_model.lower() == 'ultrasam':
+            if self.ultrasam is None:
+                from .ultrasam_backend import UltraSamSegmentor
+                self.ultrasam = UltraSamSegmentor(
+                    root=self.ultrasam_root,
+                    checkpoint=self.ultrasam_checkpoint,
+                    config=self.ultrasam_config,
+                    device=device,
+                )
+            return self.ultrasam.segment(image, bbox)
+
         processor, model = self._load_sam(self.segmentor_model, device)
         inputs = processor(images=image, input_boxes=[[bbox]], return_tensors='pt')
         inputs = {key: value.to(device) for key, value in inputs.items()}
@@ -172,7 +225,19 @@ class SonoReasonSegmentationAgent(BaseModel):
         if not image_paths:
             raise ValueError('Segmentation agent requires one ultrasound image')
         image = Image.open(image_paths[0]).convert('RGB')
-        localization = self._json(self._vlm([image], prompt))
+        localization_response = self._vlm([image], prompt)
+        try:
+            localization = self._json(localization_response)
+        except ValueError as exc:
+            # A malformed response is a sample-level model failure, not a reason
+            # to abort inference for the entire dataset.
+            return json.dumps({
+                'status': 'failed_localization', 'bbox': None,
+                'error': str(exc), 'vlm_response': localization_response[:1000],
+                'vlm_backend': self.backend, 'vlm_model': self.vlm_model_name,
+                'segmentor_model': self.segmentor_model,
+            })
+        verification_error = None
         if not localization.get('lesion_present', True):
             mask = np.zeros((image.height, image.width), bool)
             bbox, accepted, attempts = [], True, 0
@@ -184,12 +249,19 @@ class SonoReasonSegmentationAgent(BaseModel):
             for attempt in range(self.max_refinements + 1):
                 mask, confidence = self._segment(image, bbox)
                 overlay = self._overlay(image, mask, bbox)
-                verification_prompt = (
-                    f'{VERIFY_PROMPT}\n\nORIGINAL SEGMENTATION TASK:\n{prompt}\n\n'
-                    'Judge only whether the green mask segments that specified target.'
-                )
-                verification = self._json(
-                    self._vlm([image, overlay], verification_prompt))
+                verification_prompt = load_prompt_file('segmentation_verification.txt').replace(
+                    '{original_segmentation_task}', prompt)
+                verification_response = self._vlm(
+                    [image, overlay], verification_prompt)
+                try:
+                    verification = self._json(verification_response)
+                except ValueError as exc:
+                    # Keep the valid MedSAM output and let evaluation score it.
+                    # Verification is advisory; malformed verifier text must not
+                    # discard a mask or terminate the remaining dataset rows.
+                    verification_error = str(exc)
+                    attempts = attempt + 1
+                    break
                 accepted = verification.get('accept') is True
                 attempts = attempt + 1
                 if accepted or attempt == self.max_refinements:
@@ -211,6 +283,7 @@ class SonoReasonSegmentationAgent(BaseModel):
         return json.dumps({
             'status': 'completed', 'mask_path': str(mask_path), 'bbox': bbox,
             'accepted': accepted, 'attempts': attempts,
+            'verification_error': verification_error,
             'segmentor_confidence': confidence if attempts else None,
             'vlm_backend': self.backend, 'vlm_model': self.vlm_model_name,
             'segmentor_model': self.segmentor_model,
