@@ -8,6 +8,8 @@ from .medgemma import MedGemma
 from .sonoreason_segmentation_agent import SonoReasonSegmentationAgent
 from .mistral import MistralSmall
 from .llava_med import LLaVAMed
+from .healthgpt import HealthGPT
+from .huatuogpt_vision import HuatuoGPTVision
 
 from .aki import AKI
 from .aria import Aria

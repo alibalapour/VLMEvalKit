@@ -2619,6 +2619,26 @@ for group in interns1_groups:
 supported_VLM = {
 'MedGemma-4B': partial(vlm.MedGemma, model_path='google/medgemma-4b-it'),
 'MedGemma-1.5-4B': partial(vlm.MedGemma, model_path='google/medgemma-1.5-4b-it'),
+'QoQ-Med3-VL-8B': partial(
+    vlm.Qwen3VLChat,
+    model_path='ddvd233/QoQ-Med3-VL-8B',
+    use_custom_prompt=False,
+    use_vllm=False,
+),
+'QoQ-Med-VL-7B': partial(
+    vlm.Qwen2VLChat,
+    model_path='ddvd233/QoQ-Med-VL-7B',
+    use_custom_prompt=False,
+    use_vllm=False,
+    attn_implementation='sdpa',
+),
+'QoQ-Med-VL-32B': partial(
+    vlm.Qwen2VLChat,
+    model_path='ddvd233/QoQ-Med-VL-32B',
+    use_custom_prompt=False,
+    use_vllm=False,
+    attn_implementation='sdpa',
+),
 'SonoReason-Segmentation-Agent': partial(vlm.SonoReasonSegmentationAgent),
 'MedVLM-R1': partial(
     vlm.Qwen2VLChat,
@@ -2629,6 +2649,20 @@ supported_VLM = {
 ),
 'Mistral-Small-3.1-24B-Instruct-2503': partial(vlm.MistralSmall, model_path='mistralai/Mistral-Small-3.1-24B-Instruct-2503'),
 'LLaVA-Med-v1.5-Mistral-7B': partial(vlm.LLaVAMed, model_path='chaoyinshe/llava-med-v1.5-mistral-7b-hf'),
+'HuatuoGPT-Vision-7B': partial(
+    vlm.HuatuoGPTVision,
+    model_path='FreedomIntelligence/HuatuoGPT-Vision-7B-hf',
+),
+'HuatuoGPT-Vision-34B': partial(
+    vlm.HuatuoGPTVision,
+    model_path='FreedomIntelligence/HuatuoGPT-Vision-34B-hf',
+),
+'HealthGPT-L14': partial(
+    vlm.HealthGPT,
+    model_path='microsoft/phi-4',
+    hlora_repo='lintw/HealthGPT-L14',
+    hlora_file='com_hlora_weights_phi4.bin',
+),
 
 }
 
