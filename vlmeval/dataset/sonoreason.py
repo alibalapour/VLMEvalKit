@@ -754,6 +754,14 @@ class SonoReasonDD(ImageBaseDataset):
                 'Set LMUData to the dataset root and SONOREASON_DATASET_FILE '
                 'to the relative TSV path.'
             )
+        # Every DD table runs under the same dataset key, and dump_image names
+        # cached files by row index and never overwrites a readable one -- so a
+        # shared img_root silently fed later tables the images of whichever
+        # table was dumped first. Give each source TSV its own cache folder.
+        self.img_root = os.path.join(
+            self.img_root,
+            re.sub(r'[^A-Za-z0-9_.-]+', '_', os.path.splitext(relative_path)[0]),
+        )
 
         strategy = canonical_strategy()
         df = pd.read_csv(path, sep='\t')
