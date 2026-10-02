@@ -370,6 +370,10 @@ class SonoReasonDD(ImageBaseDataset):
     # local TSVs in LMUData -- no MD5/URL since these aren't hosted the way
     # VLMEvalKit expects (load_data below reads straight from $LMUData)
     DATASET_URL = {
+        # Anatomy-neutral key for multi-table configs (liver, thyroid, ovary,
+        # lymph node, ...). Deliberately absent from DATASET_PROMPT_METADATA so
+        # no breast template is ever applied to it.
+        'sonoreason_dd': '',
         'sonoreason_dd_breast': '',
         'sonoreason_dd_bus_cot': '',
         'sonoreason_dd_bus_uclm': '',
@@ -757,9 +761,11 @@ class SonoReasonDD(ImageBaseDataset):
         # Every DD table runs under the same dataset key, and dump_image names
         # cached files by row index and never overwrites a readable one -- so a
         # shared img_root silently fed later tables the images of whichever
-        # table was dumped first. Give each source TSV its own cache folder.
+        # table was dumped first. Give each source TSV its own cache folder,
+        # under a neutral root since the key (e.g. sonoreason_dd_breast) is
+        # reused for non-breast tables.
         self.img_root = os.path.join(
-            self.img_root,
+            os.path.dirname(self.img_root), 'sonoreason',
             re.sub(r'[^A-Za-z0-9_.-]+', '_', os.path.splitext(relative_path)[0]),
         )
 
