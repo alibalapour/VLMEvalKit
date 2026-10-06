@@ -297,6 +297,47 @@ FEATURE_SPECS = {
 # separate from FEATURE_SPECS because the older feature/diagnosis benchmark also
 # evaluates derived ratios and decision-rule inputs that the primitive-only
 # prompts intentionally no longer request.
+BIOMETRY_DEFAULT_OVERLAY_COLUMN = 'overlay'
+BIOMETRY_DEFAULT_ANATOMY_COLUMN = 'anatomy_location'
+
+BIOMETRY_DEFAULT_PROMPT_FILES = {
+    'fetal_head': 'fetal_head_biometry_measurements.txt',
+}
+BIOMETRY_DEFAULT_TARGETS = {
+    'fetal_head': 'fetal skull boundary',
+}
+BIOMETRY_DEFAULT_MEASUREMENT_COLUMNS = {
+    'fetal_head': {
+        'head_circumference': {
+            'head_circumference_pixels': (
+                'head_circumference_pixels', 'circumference_pixels',
+                'ground_truth_pixels', 'hc_pixels', 'hc_px'),
+        },
+    },
+}
+
+
+def _normalized_anatomy(value):
+    return re.sub(r'[^a-z0-9]+', '_', str(value).strip().lower()).strip('_')
+
+
+def _load_biometry_prompts(path):
+    text = Path(path).read_text(encoding='utf-8')
+    pattern = re.compile(
+        r'^=+\n\d+\.\s+(.+?) PROMPT\n=+\n\n(.*?)(?=^=+\n\d+\.|\Z)',
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    prompts = {
+        _normalized_anatomy(heading): prompt.strip()
+        for heading, prompt in pattern.findall(text)
+    }
+    if not prompts:
+        raise ValueError(
+            'Biometry prompt file needs numbered sections ending in PROMPT: '
+            f'{path}')
+    return prompts
+
+
 MASK_MEASUREMENT_COLUMNS = {
     'shape': {
         'long_axis': 'long_axis_pixels',
@@ -374,6 +415,7 @@ class SonoReasonDD(ImageBaseDataset):
         # lymph node, ...). Deliberately absent from DATASET_PROMPT_METADATA so
         # no breast template is ever applied to it.
         'sonoreason_dd': '',
+        'sonoreason_biometry': '',
         'sonoreason_dd_breast': '',
         'sonoreason_dd_bus_cot': '',
         'sonoreason_dd_bus_uclm': '',
@@ -748,6 +790,133 @@ class SonoReasonDD(ImageBaseDataset):
                 rows.append(row)
         return pd.DataFrame(rows)
 
+    def _build_biometry_visual_data(self, data):
+        wrapper_path = os.environ.get(
+            'SONOREASON_BIOMETRY_WRAPPER_PROMPT_FILE',
+            str(Path(__file__).resolve().parents[3] / 'experiments' / 'prompts'
+                / 'biometry_visual_measurements_overlay.txt'),
+        )
+        wrapper = Path(wrapper_path).read_text(encoding='utf-8').strip()
+        try:
+            configured_prompts = json.loads(os.environ.get(
+                'SONOREASON_BIOMETRY_PROMPT_FILES', '{}'))
+            configured_columns = json.loads(os.environ.get(
+                'SONOREASON_BIOMETRY_MEASUREMENT_COLUMNS', '{}'))
+        except json.JSONDecodeError as exc:
+            raise ValueError('Biometry mappings must be JSON objects') from exc
+        if not all(isinstance(value, dict) for value in (
+                configured_prompts, configured_columns)):
+            raise ValueError('Biometry mappings must be JSON objects')
+
+        target_file = Path(os.environ.get(
+            'SONOREASON_ANATOMY_TARGETS_FILE',
+            Path(os.environ.get('LMUData', os.path.expanduser('~/LMUData')))
+            / 'anatomy_targets.json',
+        ))
+        configured_targets = {}
+        if target_file.is_file():
+            target_payload = json.loads(target_file.read_text(encoding='utf-8'))
+            configured_targets = target_payload.get(
+                'anatomy_to_biometry_target',
+                target_payload.get('anatomy_to_segmentation_target', {}),
+            )
+            if not isinstance(configured_targets, dict):
+                raise ValueError(
+                    'Anatomy target file must contain anatomy_to_biometry_target '
+                    'or anatomy_to_segmentation_target as a mapping')
+        elif os.environ.get('SONOREASON_ANATOMY_TARGETS_FILE'):
+            raise FileNotFoundError(f'Anatomy-target mapping not found: {target_file}')
+
+        prompt_files = {
+            _normalized_anatomy(key): value for key, value in {
+                **BIOMETRY_DEFAULT_PROMPT_FILES, **configured_prompts}.items()}
+        targets = {
+            _normalized_anatomy(key): value for key, value in {
+                **BIOMETRY_DEFAULT_TARGETS, **configured_targets}.items()}
+        measurement_columns = {
+            _normalized_anatomy(key): value for key, value in {
+                **BIOMETRY_DEFAULT_MEASUREMENT_COLUMNS, **configured_columns}.items()}
+
+        anatomy_column = os.environ.get(
+            'SONOREASON_BIOMETRY_ANATOMY_COLUMN', BIOMETRY_DEFAULT_ANATOMY_COLUMN)
+        if anatomy_column not in data.columns:
+            raise ValueError(
+                'biometry_visual_features requires anatomy column '
+                f'{anatomy_column!r}; set biometry_anatomy_column if needed')
+        configured_overlay = os.environ.get(
+            'SONOREASON_BIOMETRY_OVERLAY_COLUMN', '').strip()
+        candidates = ([configured_overlay] if configured_overlay else []) + [
+            BIOMETRY_DEFAULT_OVERLAY_COLUMN, 'overlay_data', 'overlay_image', 'img_overlay']
+        overlay_column = next(
+            (column for column in candidates if column in data.columns), None)
+        if overlay_column is None:
+            raise ValueError(
+                'biometry_visual_features requires an embedded overlay image. '
+                f'Tried columns: {candidates}; set biometry_overlay_column if needed.')
+
+        id_column = next((column for column in (
+            'patient_id', 'sample_id', 'image_id', 'filename')
+            if column in data.columns), None)
+        rows = []
+        prompt_root = Path(__file__).resolve().parents[3] / 'experiments' / 'prompts'
+        for source_index, source in data.iterrows():
+            anatomy = _normalized_anatomy(source[anatomy_column])
+            prompt_file, target = prompt_files.get(anatomy), targets.get(anatomy)
+            if not prompt_file:
+                raise ValueError(
+                    f'No biometry prompt is configured for anatomy {anatomy!r}. '
+                    f'Configured: {sorted(prompt_files)}')
+            if not target:
+                raise ValueError(f'No biometry target is configured for {anatomy!r}')
+            overlay = source[overlay_column]
+            if pd.isna(overlay) or not str(overlay).strip():
+                raise ValueError(
+                    f'Empty overlay image at source row {source_index}, '
+                    f'column {overlay_column!r}')
+            prompt_path = Path(prompt_file)
+            prompts = _load_biometry_prompts(
+                prompt_path if prompt_path.is_absolute() else prompt_root / prompt_path)
+            anatomy_columns = measurement_columns.get(anatomy, {})
+            for feature, feature_prompt in prompts.items():
+                aliases = anatomy_columns.get(feature, {})
+                if not isinstance(aliases, dict):
+                    raise ValueError(
+                        f'Invalid measurement mapping for {anatomy!r}/{feature!r}')
+                truth = {}
+                for measurement, options in aliases.items():
+                    options = [options] if isinstance(options, str) else options
+                    column = next(
+                        (option for option in options if option in data.columns), None)
+                    if column is not None and _json_scalar(source[column]) is not None:
+                        truth[measurement] = _json_scalar(source[column])
+                if not truth:
+                    raise ValueError(
+                        f'No ground-truth columns found for {anatomy!r}/{feature!r}. '
+                        'Set biometry_measurement_columns to the TSV column names.')
+                sample_id = _json_scalar(source[id_column]) if id_column else source_index
+                rows.append({
+                    'index': f'{source_index}__{feature}',
+                    'source_index': source_index,
+                    'patient_id': sample_id,
+                    'dataset_name': _json_scalar(source.get('dataset_name')),
+                    'anatomy_location': anatomy,
+                    'biometry_target': str(target),
+                    'feature': feature,
+                    'image': overlay,
+                    'image_path': f'{source_index}__overlay.png',
+                    'question': wrapper.format(
+                        anatomy=anatomy.replace('_', ' '),
+                        biometry_target=str(target),
+                        feature_prompt=feature_prompt,
+                    ),
+                    'answer': '',
+                    'ground_truth_measurements': json.dumps(truth),
+                    'ground_truth_thresholds': '{}',
+                })
+        if not rows:
+            raise ValueError('No biometry measurement rows were generated')
+        return pd.DataFrame(rows)
+
     def load_data(self, dataset):
         data_root = os.environ.get('LMUData', os.path.expanduser('~/LMUData'))
         relative_path = os.environ.get('SONOREASON_DATASET_FILE', f'{dataset}.tsv')
@@ -775,6 +944,8 @@ class SonoReasonDD(ImageBaseDataset):
             return self._apply_sample_limit(self._build_segmentation_data(df))
         if strategy == 'mask_visual_features':
             return self._apply_sample_limit(self._build_mask_measurement_data(df))
+        if strategy == 'biometry_visual_features':
+            return self._apply_sample_limit(self._build_biometry_visual_data(df))
         if strategy in {'feature', 'mask_plus_features'}:
             return self._apply_sample_limit(self._build_feature_data(
                 df,
@@ -911,8 +1082,10 @@ class SonoReasonDD(ImageBaseDataset):
         return parsed if isinstance(parsed, dict) else None
 
     def _evaluate_features(self, data, eval_file):
-        expects_feature_label = canonical_strategy() != 'mask_visual_features'
-        expects_diagnosis = canonical_strategy() != 'mask_visual_features'
+        measurement_only_strategies = {
+            'mask_visual_features', 'biometry_visual_features'}
+        expects_feature_label = canonical_strategy() not in measurement_only_strategies
+        expects_diagnosis = canonical_strategy() not in measurement_only_strategies
         parsed_labels = []
         parsed_diagnoses = []
         diagnosis_hits = []
