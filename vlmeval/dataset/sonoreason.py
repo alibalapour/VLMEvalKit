@@ -314,6 +314,18 @@ BIOMETRY_DEFAULT_MEASUREMENT_COLUMNS = {
                 'ground_truth_pixels', 'hc_pixels', 'hc_px'),
         },
     },
+    # CUBS IMT and the CCAUI lumen share the carotid anatomy; their prompts
+    # request different features, so each picks up only its own columns.
+    'carotid': {
+        'intima_media_thickness': {
+            'mean_imt_pixels': 'mean_imt_pixels',
+        },
+        'lumen_geometry': {
+            'long_axis_pixels': 'long_axis_pixels',
+            'short_axis_pixels': 'short_axis_pixels',
+            'lumen_area_square_pixels': 'lumen_mask_area_pixels2',
+        },
+    },
 }
 
 
@@ -813,17 +825,23 @@ class SonoReasonDD(ImageBaseDataset):
             Path(os.environ.get('LMUData', os.path.expanduser('~/LMUData')))
             / 'anatomy_targets.json',
         ))
-        configured_targets = {}
+        configured_targets, dataset_targets = {}, {}
         if target_file.is_file():
             target_payload = json.loads(target_file.read_text(encoding='utf-8'))
             configured_targets = target_payload.get(
                 'anatomy_to_biometry_target',
                 target_payload.get('anatomy_to_segmentation_target', {}),
             )
+            # Several datasets can share one anatomy (e.g. CUBS IMT and the
+            # CCAUI lumen are both "carotid"), so a per-dataset target, keyed
+            # by the TSV's dataset_name, takes precedence over the anatomy one.
+            dataset_targets = target_payload.get('dataset_to_biometry_target', {})
             if not isinstance(configured_targets, dict):
                 raise ValueError(
                     'Anatomy target file must contain anatomy_to_biometry_target '
                     'or anatomy_to_segmentation_target as a mapping')
+            if not isinstance(dataset_targets, dict):
+                raise ValueError('dataset_to_biometry_target must be a mapping')
         elif os.environ.get('SONOREASON_ANATOMY_TARGETS_FILE'):
             raise FileNotFoundError(f'Anatomy-target mapping not found: {target_file}')
 
@@ -861,13 +879,19 @@ class SonoReasonDD(ImageBaseDataset):
         prompt_root = Path(__file__).resolve().parents[3] / 'experiments' / 'prompts'
         for source_index, source in data.iterrows():
             anatomy = _normalized_anatomy(source[anatomy_column])
-            prompt_file, target = prompt_files.get(anatomy), targets.get(anatomy)
+            dataset_name = _json_scalar(source.get('dataset_name'))
+            prompt_file = prompt_files.get(anatomy)
+            target = dataset_targets.get(dataset_name) or targets.get(anatomy)
             if not prompt_file:
                 raise ValueError(
                     f'No biometry prompt is configured for anatomy {anatomy!r}. '
                     f'Configured: {sorted(prompt_files)}')
             if not target:
                 raise ValueError(f'No biometry target is configured for {anatomy!r}')
+            if not isinstance(target, str):
+                raise ValueError(
+                    f'Biometry target for {anatomy!r} is ambiguous ({target!r}); add '
+                    f'{dataset_name!r} to dataset_to_biometry_target')
             overlay = source[overlay_column]
             if pd.isna(overlay) or not str(overlay).strip():
                 raise ValueError(
@@ -898,7 +922,7 @@ class SonoReasonDD(ImageBaseDataset):
                     'index': f'{source_index}__{feature}',
                     'source_index': source_index,
                     'patient_id': sample_id,
-                    'dataset_name': _json_scalar(source.get('dataset_name')),
+                    'dataset_name': dataset_name,
                     'anatomy_location': anatomy,
                     'biometry_target': str(target),
                     'feature': feature,
