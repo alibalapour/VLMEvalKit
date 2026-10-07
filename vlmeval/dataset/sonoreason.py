@@ -326,6 +326,12 @@ BIOMETRY_DEFAULT_MEASUREMENT_COLUMNS = {
             'lumen_area_square_pixels': 'lumen_mask_area_pixels2',
         },
     },
+    'optic_nerve': {
+        'optic_nerve_diameters': {
+            'optic_nerve_diameter_pixels': 'ond_pixels',
+            'optic_nerve_sheath_diameter_pixels': 'onsd_pixels',
+        },
+    },
 }
 
 
@@ -348,6 +354,24 @@ def _load_biometry_prompts(path):
             'Biometry prompt file needs numbered sections ending in PROMPT: '
             f'{path}')
     return prompts
+
+
+def _fill_row_placeholders(prompt, source):
+    """Replace {{column}} in a biometry prompt with that row's value.
+
+    Lets a shared prompt carry per-image geometry, e.g. the optic-nerve
+    measurement depth in pixels. Numbers are rounded to one decimal place to
+    match the precision the prompts ask for.
+    """
+    def replace(match):
+        column = match.group(1)
+        if column not in source.index:
+            raise ValueError(f'Biometry prompt placeholder {{{{{column}}}}} has no TSV column')
+        value = _json_scalar(source[column])
+        if value is None:
+            raise ValueError(f'Biometry prompt placeholder {{{{{column}}}}} is empty in this row')
+        return f'{value:.1f}' if isinstance(value, float) else str(value)
+    return re.sub(r'\{\{\s*(\w+)\s*\}\}', replace, prompt)
 
 
 MASK_MEASUREMENT_COLUMNS = {
@@ -931,7 +955,7 @@ class SonoReasonDD(ImageBaseDataset):
                     'question': wrapper.format(
                         anatomy=anatomy.replace('_', ' '),
                         biometry_target=str(target),
-                        feature_prompt=feature_prompt,
+                        feature_prompt=_fill_row_placeholders(feature_prompt, source),
                     ),
                     'answer': '',
                     'ground_truth_measurements': json.dumps(truth),
