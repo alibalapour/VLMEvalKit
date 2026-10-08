@@ -1,13 +1,18 @@
+import ast
+import base64
 import importlib.util
+import io
 import json
 import logging
 import os
 import sys
+import tempfile
 import types
 import unittest
 from unittest import mock
 
 import pandas as pd
+from PIL import Image
 
 
 def _load_sonoreason():
@@ -22,6 +27,8 @@ def _load_sonoreason():
     prompts = types.ModuleType('vlmeval.dataset.sonoreason_prompts')
     prompts.resolve_prompt_template = lambda **kwargs: ('test', {})
     prompts.build_prompt_variants = lambda template: {'direct_prompt': ''}
+    prompts.load_prompt_file = (
+        lambda filename: '{anatomy} {segmentation_target} {feature_name} {feature_prompt}')
 
     smp = types.ModuleType('vlmeval.smp')
     smp.get_logger = logging.getLogger
@@ -140,6 +147,53 @@ class TestSonoReasonFeatureExpansion(unittest.TestCase):
             expanded['image'].tolist(),
             ['base64-image-payload', 'base64-image-payload'],
         )
+
+    def test_mask_measurement_rows_keep_aspect_ratio_and_scale_lengths(self):
+        def encode(image):
+            buffer = io.BytesIO()
+            image.save(buffer, format='PNG')
+            return base64.b64encode(buffer.getvalue()).decode()
+
+        mask = Image.new('L', (40, 20))
+        mask.paste(255, (10, 5, 30, 15))  # 20x10 lesion on a 40x20 landscape image
+        columns = {
+            column
+            for spec in self.module.MASK_MEASUREMENT_COLUMNS.values()
+            for column in spec.values()
+        }
+        source = pd.DataFrame([{
+            **{column: 1.0 for column in columns},
+            'long_axis_pixels': 20.0,
+            'orientation_degrees': 10.0,
+            'img_data': encode(Image.new('L', (40, 20), 90)),
+            'mask': encode(mask),
+            'anatomy_location': 'breast',
+            'patient_id': 'p1',
+            'dataset_name': 'd1',
+        }])
+        prompts = {feature: 'prompt' for feature in self.module.MASK_MEASUREMENT_COLUMNS}
+        with tempfile.TemporaryDirectory() as tmp:
+            targets = os.path.join(tmp, 'targets.json')
+            with open(targets, 'w') as handle:
+                json.dump({'anatomy_to_segmentation_target': {'breast': 'breast lesion'}}, handle)
+            with (
+                mock.patch.object(self.module, '_load_feature_prompts', return_value=prompts),
+                mock.patch.dict(os.environ, {
+                    'SONOREASON_FEATURE_PROMPTS_FILE': 'unused',
+                    'SONOREASON_ANATOMY_TARGETS_FILE': targets,
+                }, clear=True),
+            ):
+                rows = self.dataset._build_mask_measurement_data(source).set_index('feature')
+
+        _, canvas_mask = ast.literal_eval(rows.loc['shape', 'image'])
+        canvas_mask = Image.open(io.BytesIO(base64.b64decode(canvas_mask)))
+        x0, y0, x1, y1 = canvas_mask.getbbox()
+        self.assertEqual(canvas_mask.size, (896, 896))
+        self.assertAlmostEqual((x1 - x0) / (y1 - y0), 2.0, places=2)
+        shape = json.loads(rows.loc['shape', 'ground_truth_measurements'])
+        orientation = json.loads(rows.loc['orientation', 'ground_truth_measurements'])
+        self.assertAlmostEqual(shape['long_axis'], 20.0 * 896 / 40)
+        self.assertEqual(orientation['orientation_degrees'], 10.0)
 
 
 if __name__ == '__main__':

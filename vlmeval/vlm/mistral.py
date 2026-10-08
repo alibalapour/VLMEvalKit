@@ -7,12 +7,16 @@ class MistralSmall(BaseModel):
     INSTALL_REQ = False
     INTERLEAVE = True          # supports interleaved image+text
 
-    def __init__(self, model_path='mistralai/Mistral-Small-3.1-24B-Instruct-2503', **kwargs):
+    def __init__(self, model_path='mistralai/Mistral-Small-3.1-24B-Instruct-2503',
+                 chat_template_kwargs=None, **kwargs):
         from transformers import AutoProcessor, AutoModelForImageTextToText
         self.processor = AutoProcessor.from_pretrained(model_path)
         self.model = AutoModelForImageTextToText.from_pretrained(
             model_path, torch_dtype=torch.bfloat16,
             device_map='auto', low_cpu_mem_usage=True).eval()
+        # Extra chat-template variables, e.g. {'enable_thinking': False} for
+        # Qwen3.x, whose template opens a <think> block unless told not to.
+        self.chat_template_kwargs = chat_template_kwargs or {}
         # See sonoreason_gen.py -- same tag-banning pathology as the other two
         # adapters, milder here only because this model formats more reliably.
         self.gen_kwargs = default_gen_kwargs(tokenizer=self.processor.tokenizer, **kwargs)
@@ -32,7 +36,7 @@ class MistralSmall(BaseModel):
         messages = [{'role': 'user', 'content': content}]
         inputs = self.processor.apply_chat_template(
             messages, add_generation_prompt=True, tokenize=True,
-            return_dict=True, return_tensors='pt'
+            return_dict=True, return_tensors='pt', **self.chat_template_kwargs,
         ).to(self.model.device, dtype=torch.bfloat16)
         if self.prefill_ids:
             in_len = apply_prefill(inputs, self.prefill_ids)
