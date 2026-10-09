@@ -2648,6 +2648,10 @@ supported_VLM = {
     temperature=1.0,
 ),
 'Mistral-Small-3.1-24B-Instruct-2503': partial(vlm.MistralSmall, model_path='mistralai/Mistral-Small-3.1-24B-Instruct-2503'),
+# Same generic HF image-text adapter as Mistral; thinking off so the JSON answer
+# fits the shared 768-token budget and decoding matches the other models.
+'Qwen3.8-27B': partial(vlm.MistralSmall, model_path='Qwen/Qwen3.8-27B',
+                      chat_template_kwargs={'enable_thinking': False}),
 'LLaVA-Med-v1.5-Mistral-7B': partial(vlm.LLaVAMed, model_path='chaoyinshe/llava-med-v1.5-mistral-7b-hf'),
 'HuatuoGPT-Vision-7B': partial(
     vlm.HuatuoGPTVision,

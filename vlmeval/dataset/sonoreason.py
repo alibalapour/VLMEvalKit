@@ -448,6 +448,33 @@ def _encoded_image_size(value):
         return image.size
 
 
+# Every model gets the same undistorted input: image and mask are padded to a
+# centred black square and resized to CANVAS_SIZE x CANVAS_SIZE. MedGemma
+# (Gemma 3) squeezes any input to 896x896 regardless of aspect ratio, while
+# Mistral (Pixtral) and Qwen keep near-native sizes; all of them pass an
+# 896x896 image through unchanged. Pixel-length ground truth is rescaled to
+# the canvas so it is in the units the prompt asks for.
+CANVAS_SIZE = 896
+PIXEL_LENGTH_MEASUREMENTS = {
+    'long_axis', 'short_axis', 'bounding_box_width', 'bounding_box_height'}
+
+
+def _square_canvas(value, resample):
+    """Return (base64 PNG on the canvas, original-to-canvas pixel scale)."""
+    encoded = str(value).strip()
+    if encoded.startswith('data:'):
+        encoded = encoded.split(',', 1)[1]
+    image = Image.open(io.BytesIO(base64.b64decode(encoded)))
+    if image.mode not in ('L', 'RGB'):
+        image = image.convert('RGB')
+    side = max(image.size)
+    canvas = Image.new(image.mode, (side, side))
+    canvas.paste(image, ((side - image.width) // 2, (side - image.height) // 2))
+    buffer = io.BytesIO()
+    canvas.resize((CANVAS_SIZE, CANVAS_SIZE), resample).save(buffer, format='PNG')
+    return base64.b64encode(buffer.getvalue()).decode('ascii'), CANVAS_SIZE / side
+
+
 class SonoReasonDD(ImageBaseDataset):
     TYPE = 'VQA'
     # local TSVs in LMUData -- no MD5/URL since these aren't hosted the way
@@ -789,6 +816,7 @@ class SonoReasonDD(ImageBaseDataset):
                     f'Empty segmentation target for anatomy {anatomy!r} '
                     f'in {target_file}')
             primary_image_index = f'{source_index}__shape'
+<<<<<<< HEAD
             # Image and mask share one size (mismatched pairs were excluded
             # above); prompts state it as the pixel frame, as in biometry.
             image_width, image_height = _encoded_image_size(source['img_data'])
@@ -798,6 +826,10 @@ class SonoReasonDD(ImageBaseDataset):
             }
             row_wrapper = _fill_row_placeholders(
                 load_prompt_file('mask_visual_features.txt'), source, computed)
+=======
+            canvas_image, canvas_scale = _square_canvas(source['img_data'], Image.BILINEAR)
+            canvas_mask, _ = _square_canvas(source['mask'], Image.NEAREST)
+>>>>>>> 7f1c560cfcbd24583c2dcad446d569db9a887973
             for feature in measurement_features:
                 feature_question = row_wrapper.format(
                     anatomy=anatomy,
@@ -806,6 +838,13 @@ class SonoReasonDD(ImageBaseDataset):
                     feature_prompt=_fill_row_placeholders(
                         prompts[feature], source, computed),
                 )
+                truth = {}
+                for target_name, column in MASK_MEASUREMENT_COLUMNS[feature].items():
+                    value = _json_scalar(source.get(column))
+                    if value is not None:
+                        truth[target_name] = (
+                            value * canvas_scale
+                            if target_name in PIXEL_LENGTH_MEASUREMENTS else value)
                 row = {
                     'index': f'{source_index}__{feature}',
                     'source_index': source_index,
@@ -821,7 +860,7 @@ class SonoReasonDD(ImageBaseDataset):
                     # pandas materialize a NumPy array, for which pd.isna(x)
                     # has an ambiguous truth value during base initialization.
                     'image': (
-                        repr([source['img_data'], source['mask']])
+                        repr([canvas_image, canvas_mask])
                         if feature == 'shape' else primary_image_index),
                     # Every feature row refers to the same source image-mask
                     # pair.  Stable shared paths let dump_image decode that
@@ -832,11 +871,8 @@ class SonoReasonDD(ImageBaseDataset):
                     ]),
                     'question': feature_question,
                     'answer': '',
-                    'ground_truth_measurements': json.dumps({
-                        target_name: _json_scalar(source.get(column))
-                        for target_name, column in MASK_MEASUREMENT_COLUMNS[feature].items()
-                        if _json_scalar(source.get(column)) is not None
-                    }),
+                    'ground_truth_measurements': json.dumps(truth),
+                    'canvas_scale': canvas_scale,
                     'ground_truth_thresholds': '{}',
                 }
                 rows.append(row)
