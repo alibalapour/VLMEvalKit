@@ -62,6 +62,8 @@ def default_gen_kwargs(tokenizer=None, **overrides):
 
     Env overrides (all optional):
       SONOREASON_GEN_MAX_NEW_TOKENS   (default 768)
+      SONOREASON_GEN_DO_SAMPLE        'true'/'false' (default false = greedy)
+      SONOREASON_GEN_TEMPERATURE / _TOP_P / _TOP_K   used only when sampling
       SONOREASON_GEN_REPETITION_PENALTY (default 1.05; 1.0 disables)
       SONOREASON_GEN_NO_REPEAT_NGRAM  (default 0 = disabled -- do NOT set this
                                        to a small value, see module docstring)
@@ -86,10 +88,21 @@ def default_gen_kwargs(tokenizer=None, **overrides):
     else:
         default_max_new = 1600 if strategy == 'structured' else 768
 
+    do_sample = os.environ.get('SONOREASON_GEN_DO_SAMPLE', 'false').lower() == 'true'
     kwargs = dict(
         max_new_tokens=_env_int('SONOREASON_GEN_MAX_NEW_TOKENS', default_max_new),
-        do_sample=False,
+        do_sample=do_sample,
     )
+    # Sampling knobs only mean something when sampling; HF warns if they are
+    # passed alongside greedy decoding.
+    if do_sample:
+        for name, env_key, read in (
+                ('temperature', 'SONOREASON_GEN_TEMPERATURE', _env_float),
+                ('top_p', 'SONOREASON_GEN_TOP_P', _env_float),
+                ('top_k', 'SONOREASON_GEN_TOP_K', _env_int)):
+            value = read(env_key, None)
+            if value is not None:
+                kwargs[name] = value
 
     rep = _env_float('SONOREASON_GEN_REPETITION_PENALTY', 1.05)
     if rep and rep != 1.0:

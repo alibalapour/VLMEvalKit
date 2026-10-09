@@ -356,15 +356,21 @@ def _load_biometry_prompts(path):
     return prompts
 
 
-def _fill_row_placeholders(prompt, source):
+def _fill_row_placeholders(prompt, source, computed=None):
     """Replace {{column}} in a biometry prompt with that row's value.
 
     Lets a shared prompt carry per-image geometry, e.g. the optic-nerve
-    measurement depth in pixels. Numbers are rounded to one decimal place to
-    match the precision the prompts ask for.
+    measurement depth in pixels. `computed` supplies values derived from the
+    row rather than stored in it (the size of the image the model is shown),
+    and takes precedence over a TSV column of the same name. Numbers are
+    rounded to one decimal place to match the precision the prompts ask for.
     """
+    computed = computed or {}
+
     def replace(match):
         column = match.group(1)
+        if column in computed:
+            return str(computed[column])
         if column not in source.index:
             raise ValueError(f'Biometry prompt placeholder {{{{{column}}}}} has no TSV column')
         value = _json_scalar(source[column])
@@ -783,12 +789,22 @@ class SonoReasonDD(ImageBaseDataset):
                     f'Empty segmentation target for anatomy {anatomy!r} '
                     f'in {target_file}')
             primary_image_index = f'{source_index}__shape'
+            # Image and mask share one size (mismatched pairs were excluded
+            # above); prompts state it as the pixel frame, as in biometry.
+            image_width, image_height = _encoded_image_size(source['img_data'])
+            computed = {
+                'image_width_pixels': image_width,
+                'image_height_pixels': image_height,
+            }
+            row_wrapper = _fill_row_placeholders(
+                load_prompt_file('mask_visual_features.txt'), source, computed)
             for feature in measurement_features:
-                feature_question = load_prompt_file('mask_visual_features.txt').format(
+                feature_question = row_wrapper.format(
                     anatomy=anatomy,
                     segmentation_target=target,
                     feature_name=feature,
-                    feature_prompt=prompts[feature],
+                    feature_prompt=_fill_row_placeholders(
+                        prompts[feature], source, computed),
                 )
                 row = {
                     'index': f'{source_index}__{feature}',
@@ -921,6 +937,14 @@ class SonoReasonDD(ImageBaseDataset):
                 raise ValueError(
                     f'Empty overlay image at source row {source_index}, '
                     f'column {overlay_column!r}')
+            # Size of the image the model is actually shown, so prompts can
+            # state the pixel frame the measurements are reported in.
+            overlay_width, overlay_height = _encoded_image_size(overlay)
+            computed = {
+                'image_width_pixels': overlay_width,
+                'image_height_pixels': overlay_height,
+            }
+            row_wrapper = _fill_row_placeholders(wrapper, source, computed)
             prompt_path = Path(prompt_file)
             prompts = _load_biometry_prompts(
                 prompt_path if prompt_path.is_absolute() else prompt_root / prompt_path)
@@ -952,10 +976,11 @@ class SonoReasonDD(ImageBaseDataset):
                     'feature': feature,
                     'image': overlay,
                     'image_path': f'{source_index}__overlay.png',
-                    'question': wrapper.format(
+                    'question': row_wrapper.format(
                         anatomy=anatomy.replace('_', ' '),
                         biometry_target=str(target),
-                        feature_prompt=_fill_row_placeholders(feature_prompt, source),
+                        feature_prompt=_fill_row_placeholders(
+                            feature_prompt, source, computed),
                     ),
                     'answer': '',
                     'ground_truth_measurements': json.dumps(truth),

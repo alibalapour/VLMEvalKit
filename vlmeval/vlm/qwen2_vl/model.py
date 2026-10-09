@@ -200,6 +200,18 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
         self.total_pixels = total_pixels
+        # SONOREASON_GEN_* come from the experiment config's decoding keys, so
+        # every model in a comparison decodes the same way as the
+        # sonoreason_gen.py adapters. Unset keeps the defaults above.
+        def env(name, cast, default):
+            raw = os.environ.get(f'SONOREASON_GEN_{name}')
+            return cast(raw) if raw else default
+        max_new_tokens = env('MAX_NEW_TOKENS', int, max_new_tokens)
+        do_sample = env('DO_SAMPLE', lambda raw: raw.lower() == 'true', do_sample)
+        temperature = env('TEMPERATURE', float, temperature)
+        top_p = env('TOP_P', float, top_p)
+        top_k = env('TOP_K', int, top_k)
+        repetition_penalty = env('REPETITION_PENALTY', float, repetition_penalty)
         self.max_new_tokens = max_new_tokens
         if self.total_pixels and self.total_pixels > 24576 * 28 * 28:
             print('The total number of video tokens might become too large, resulting in an overly long input sequence. We recommend lowering **total_pixels** to below **24576 × 28 × 28**.')  # noqa: E501
@@ -322,8 +334,11 @@ class Qwen2VLChat(Qwen2VLPromptMixin, BaseModel):
             self.device = 'cuda'
         else:
             attn_implementation = kwargs.get('attn_implementation', 'flash_attention_2')
+            # SONOREASON_TORCH_DTYPE comes from the experiment config's torch_dtype;
+            # unset keeps 'auto', which follows the checkpoint's config.json.
             model_kwargs = dict(
-                torch_dtype='auto', device_map="auto", attn_implementation=attn_implementation
+                torch_dtype=os.environ.get('SONOREASON_TORCH_DTYPE') or 'auto',
+                device_map="auto", attn_implementation=attn_implementation
             )
             if model_config is not None:
                 model_kwargs['config'] = model_config
