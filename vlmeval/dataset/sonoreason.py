@@ -816,20 +816,17 @@ class SonoReasonDD(ImageBaseDataset):
                     f'Empty segmentation target for anatomy {anatomy!r} '
                     f'in {target_file}')
             primary_image_index = f'{source_index}__shape'
-<<<<<<< HEAD
-            # Image and mask share one size (mismatched pairs were excluded
-            # above); prompts state it as the pixel frame, as in biometry.
-            image_width, image_height = _encoded_image_size(source['img_data'])
+            canvas_image, canvas_scale = _square_canvas(source['img_data'], Image.BILINEAR)
+            canvas_mask, _ = _square_canvas(source['mask'], Image.NEAREST)
+            # The model is shown the square canvas, not the original image, so
+            # the prompt states the canvas as the pixel frame -- the same frame
+            # the pixel-length ground truth is rescaled to below.
             computed = {
-                'image_width_pixels': image_width,
-                'image_height_pixels': image_height,
+                'image_width_pixels': CANVAS_SIZE,
+                'image_height_pixels': CANVAS_SIZE,
             }
             row_wrapper = _fill_row_placeholders(
                 load_prompt_file('mask_visual_features.txt'), source, computed)
-=======
-            canvas_image, canvas_scale = _square_canvas(source['img_data'], Image.BILINEAR)
-            canvas_mask, _ = _square_canvas(source['mask'], Image.NEAREST)
->>>>>>> 7f1c560cfcbd24583c2dcad446d569db9a887973
             for feature in measurement_features:
                 feature_question = row_wrapper.format(
                     anatomy=anatomy,
