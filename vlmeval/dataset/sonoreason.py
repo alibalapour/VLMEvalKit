@@ -816,7 +816,6 @@ class SonoReasonDD(ImageBaseDataset):
                     f'Empty segmentation target for anatomy {anatomy!r} '
                     f'in {target_file}')
             primary_image_index = f'{source_index}__shape'
-<<<<<<< HEAD
             # Image and mask share one size (mismatched pairs were excluded
             # above); prompts state it as the pixel frame, as in biometry.
             image_width, image_height = _encoded_image_size(source['img_data'])
@@ -826,10 +825,6 @@ class SonoReasonDD(ImageBaseDataset):
             }
             row_wrapper = _fill_row_placeholders(
                 load_prompt_file('mask_visual_features.txt'), source, computed)
-=======
-            canvas_image, canvas_scale = _square_canvas(source['img_data'], Image.BILINEAR)
-            canvas_mask, _ = _square_canvas(source['mask'], Image.NEAREST)
->>>>>>> 7f1c560cfcbd24583c2dcad446d569db9a887973
             for feature in measurement_features:
                 feature_question = row_wrapper.format(
                     anatomy=anatomy,
@@ -838,13 +833,13 @@ class SonoReasonDD(ImageBaseDataset):
                     feature_prompt=_fill_row_placeholders(
                         prompts[feature], source, computed),
                 )
-                truth = {}
-                for target_name, column in MASK_MEASUREMENT_COLUMNS[feature].items():
-                    value = _json_scalar(source.get(column))
-                    if value is not None:
-                        truth[target_name] = (
-                            value * canvas_scale
-                            if target_name in PIXEL_LENGTH_MEASUREMENTS else value)
+                # Ground truth stays in original-image pixels, the frame the
+                # prompt states and the images are shown in.
+                truth = {
+                    target_name: _json_scalar(source.get(column))
+                    for target_name, column in MASK_MEASUREMENT_COLUMNS[feature].items()
+                    if _json_scalar(source.get(column)) is not None
+                }
                 row = {
                     'index': f'{source_index}__{feature}',
                     'source_index': source_index,
@@ -860,7 +855,7 @@ class SonoReasonDD(ImageBaseDataset):
                     # pandas materialize a NumPy array, for which pd.isna(x)
                     # has an ambiguous truth value during base initialization.
                     'image': (
-                        repr([canvas_image, canvas_mask])
+                        repr([source['img_data'], source['mask']])
                         if feature == 'shape' else primary_image_index),
                     # Every feature row refers to the same source image-mask
                     # pair.  Stable shared paths let dump_image decode that
@@ -872,7 +867,6 @@ class SonoReasonDD(ImageBaseDataset):
                     'question': feature_question,
                     'answer': '',
                     'ground_truth_measurements': json.dumps(truth),
-                    'canvas_scale': canvas_scale,
                     'ground_truth_thresholds': '{}',
                 }
                 rows.append(row)
