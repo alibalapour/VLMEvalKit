@@ -1200,6 +1200,11 @@ class SonoReasonDD(ImageBaseDataset):
     @staticmethod
     def _parse_feature_prediction(value):
         text = str(value).strip()
+        # Models that reason before answering (e.g. MedGemma-27B) can write braces
+        # or a draft object ahead of their final ```json block; parse that block.
+        fence = text.rfind('```json')
+        if fence >= 0:
+            text = text[fence + len('```json'):]
         # Reasoning-tuned models such as MedVLM-R1 may wrap the requested JSON
         # in <think>/<answer> tags. Parse only the outermost JSON object when
         # one is present, while preserving json_repair for malformed JSON.

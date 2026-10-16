@@ -200,5 +200,24 @@ class TestSonoReasonFeatureExpansion(unittest.TestCase):
         self.assertEqual(orientation['orientation_degrees'], 10.0)
 
 
+class TestSonoReasonFeatureParsing(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.parse = staticmethod(_load_sonoreason().SonoReasonDD._parse_feature_prediction)
+
+    def test_reasoning_before_the_json_block_is_ignored(self):
+        # MedGemma-27B style: braces and a draft object precede the final answer.
+        text = ('thought\nSet {W, H} first. Draft: {"feature": "shape", "measurements": '
+                '{"long_axis": "L"}}\n```json\n{"feature": "shape", "measurements": '
+                '{"long_axis": 120, "short_axis": 80}}\n```')
+        self.assertEqual(self.parse(text)['measurements'], {'long_axis': 120, 'short_axis': 80})
+
+    def test_answer_tags_without_a_fence_still_parse(self):
+        text = '<think>reasoning</think><answer>{"label": "benign"}</answer>'
+        self.assertEqual(self.parse(text), {'label': 'benign'})
+
+
+
 if __name__ == '__main__':
     unittest.main()
