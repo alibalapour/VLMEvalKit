@@ -1199,7 +1199,9 @@ class SonoReasonDD(ImageBaseDataset):
 
     @staticmethod
     def _parse_feature_prediction(value):
-        text = str(value).strip()
+        # A closed Gemma thought channel (MedGemma with thinking on) is dropped;
+        # an unclosed one leaves no answer (see strip_thinking).
+        text = strip_thinking(str(value)).strip()
         # Models that reason before answering (e.g. MedGemma-27B) can write braces
         # or a draft object ahead of their final ```json block; parse that block.
         fence = text.rfind('```json')

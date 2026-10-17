@@ -217,6 +217,14 @@ class TestSonoReasonFeatureParsing(unittest.TestCase):
         text = '<think>reasoning</think><answer>{"label": "benign"}</answer>'
         self.assertEqual(self.parse(text), {'label': 'benign'})
 
+    def test_closed_thought_channel_is_dropped(self):
+        # MedGemma with thinking on: the thought may hold braces; the answer follows it.
+        text = '<unused94>thought\nUse {W, H}.<unused95>{"label": "benign"}'
+        self.assertEqual(self.parse(text), {'label': 'benign'})
+
+    def test_unclosed_thought_channel_has_no_answer(self):
+        text = '<unused94>thought\nThe draft is {"label": "benign"} but'
+        self.assertIsNone(self.parse(text))
 
 
 if __name__ == '__main__':
