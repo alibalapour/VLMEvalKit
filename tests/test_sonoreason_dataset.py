@@ -28,7 +28,8 @@ def _load_sonoreason():
     prompts.resolve_prompt_template = lambda **kwargs: ('test', {})
     prompts.build_prompt_variants = lambda template: {'direct_prompt': ''}
     prompts.load_prompt_file = (
-        lambda filename: '{anatomy} {segmentation_target} {feature_name} {feature_prompt}')
+        lambda filename: '{anatomy} {segmentation_target} {feature_name} {feature_prompt} '
+                         '{{image_width_pixels}}x{{image_height_pixels}}')
 
     smp = types.ModuleType('vlmeval.smp')
     smp.get_logger = logging.getLogger
@@ -148,7 +149,7 @@ class TestSonoReasonFeatureExpansion(unittest.TestCase):
             ['base64-image-payload', 'base64-image-payload'],
         )
 
-    def test_mask_measurement_rows_keep_aspect_ratio_and_scale_lengths(self):
+    def test_mask_measurement_rows_keep_original_size_and_lengths(self):
         def encode(image):
             buffer = io.BytesIO()
             image.save(buffer, format='PNG')
@@ -185,15 +186,45 @@ class TestSonoReasonFeatureExpansion(unittest.TestCase):
             ):
                 rows = self.dataset._build_mask_measurement_data(source).set_index('feature')
 
-        _, canvas_mask = ast.literal_eval(rows.loc['shape', 'image'])
-        canvas_mask = Image.open(io.BytesIO(base64.b64decode(canvas_mask)))
-        x0, y0, x1, y1 = canvas_mask.getbbox()
-        self.assertEqual(canvas_mask.size, (896, 896))
-        self.assertAlmostEqual((x1 - x0) / (y1 - y0), 2.0, places=2)
+        # Images, prompt and ground truth all stay in original-image pixels.
+        image, shown_mask = ast.literal_eval(rows.loc['shape', 'image'])
+        self.assertEqual(image, source.loc[0, 'img_data'])
+        self.assertEqual(shown_mask, source.loc[0, 'mask'])
+        shown_mask = Image.open(io.BytesIO(base64.b64decode(shown_mask)))
+        self.assertEqual(shown_mask.size, (40, 20))
+        self.assertEqual(shown_mask.getbbox(), (10, 5, 30, 15))
+        self.assertTrue(rows.loc['shape', 'question'].endswith('40x20'))
         shape = json.loads(rows.loc['shape', 'ground_truth_measurements'])
         orientation = json.loads(rows.loc['orientation', 'ground_truth_measurements'])
-        self.assertAlmostEqual(shape['long_axis'], 20.0 * 896 / 40)
+        self.assertEqual(shape['long_axis'], 20.0)
         self.assertEqual(orientation['orientation_degrees'], 10.0)
+
+
+class TestSonoReasonFeatureParsing(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.parse = staticmethod(_load_sonoreason().SonoReasonDD._parse_feature_prediction)
+
+    def test_reasoning_before_the_json_block_is_ignored(self):
+        # MedGemma-27B style: braces and a draft object precede the final answer.
+        text = ('thought\nSet {W, H} first. Draft: {"feature": "shape", "measurements": '
+                '{"long_axis": "L"}}\n```json\n{"feature": "shape", "measurements": '
+                '{"long_axis": 120, "short_axis": 80}}\n```')
+        self.assertEqual(self.parse(text)['measurements'], {'long_axis': 120, 'short_axis': 80})
+
+    def test_answer_tags_without_a_fence_still_parse(self):
+        text = '<think>reasoning</think><answer>{"label": "benign"}</answer>'
+        self.assertEqual(self.parse(text), {'label': 'benign'})
+
+    def test_closed_thought_channel_is_dropped(self):
+        # MedGemma with thinking on: the thought may hold braces; the answer follows it.
+        text = '<unused94>thought\nUse {W, H}.<unused95>{"label": "benign"}'
+        self.assertEqual(self.parse(text), {'label': 'benign'})
+
+    def test_unclosed_thought_channel_has_no_answer(self):
+        text = '<unused94>thought\nThe draft is {"label": "benign"} but'
+        self.assertIsNone(self.parse(text))
 
 
 if __name__ == '__main__':

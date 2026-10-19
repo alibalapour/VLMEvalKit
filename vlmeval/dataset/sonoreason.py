@@ -720,12 +720,19 @@ class SonoReasonDD(ImageBaseDataset):
             raise ValueError('No labeled breast rows are available for feature_diagnosis')
         return pd.DataFrame(rows)
 
-    def _build_mask_measurement_data(self, data):
-        """Build anatomy-aware image+mask measurement rows from published DD data."""
+    def _build_mask_measurement_data(self, data, include_mask=True):
+        """Build anatomy-aware measurement rows from published DD data.
+
+        With include_mask=False (image_only_visual_features) the model sees only
+        the original image. Rows are still filtered on the mask exactly as the
+        image+mask arm is, since the ground-truth measurements are mask-derived
+        and both arms must score the same images.
+        """
+        strategy = canonical_strategy()
         prompt_file = os.environ.get('SONOREASON_FEATURE_PROMPTS_FILE')
         if not prompt_file:
             raise ValueError(
-                'mask_visual_features requires SONOREASON_FEATURE_PROMPTS_FILE')
+                f'{strategy} requires SONOREASON_FEATURE_PROMPTS_FILE')
         measurement_features = list(MASK_MEASUREMENT_COLUMNS)
         prompts = _load_feature_prompts(prompt_file, measurement_features)
         required = {
@@ -736,14 +743,14 @@ class SonoReasonDD(ImageBaseDataset):
         missing = required - set(data.columns)
         if missing:
             raise ValueError(
-                'mask_visual_features expects a published mask-bearing DD table; '
+                f'{strategy} expects a published mask-bearing DD table; '
                 f'missing columns: {sorted(missing)}')
 
         has_mask = data['mask'].notna() & data['mask'].astype(str).str.strip().ne('')
         skipped = int((~has_mask).sum())
         if skipped:
             logger.warning(
-                f'[SonoReasonDD] mask_visual_features skipped {skipped}/{len(data)} '
+                f'[SonoReasonDD] {strategy} skipped {skipped}/{len(data)} '
                 'rows without an embedded mask')
         data = data.loc[has_mask].reset_index(drop=True)
         if data.empty:
@@ -763,7 +770,7 @@ class SonoReasonDD(ImageBaseDataset):
         mismatched_count = len(data) - len(aligned_rows)
         if mismatched_count:
             logger.warning(
-                f'[SonoReasonDD] mask_visual_features excluded {mismatched_count}/'
+                f'[SonoReasonDD] {strategy} excluded {mismatched_count}/'
                 f'{len(data)} rows whose image and mask dimensions differ. '
                 f'Examples: {"; ".join(mismatched_examples)}')
         data = data.iloc[aligned_rows].reset_index(drop=True)
@@ -786,7 +793,7 @@ class SonoReasonDD(ImageBaseDataset):
             if source_limit > 0:
                 data = data.head(source_limit).reset_index(drop=True)
                 logger.warning(
-                    f'[SonoReasonDD] mask_visual_features limited to '
+                    f'[SonoReasonDD] {strategy} limited to '
                     f'{len(data)} source images before per-feature expansion')
 
         target_file = Path(os.environ.get(
@@ -816,17 +823,18 @@ class SonoReasonDD(ImageBaseDataset):
                     f'Empty segmentation target for anatomy {anatomy!r} '
                     f'in {target_file}')
             primary_image_index = f'{source_index}__shape'
-            canvas_image, canvas_scale = _square_canvas(source['img_data'], Image.BILINEAR)
-            canvas_mask, _ = _square_canvas(source['mask'], Image.NEAREST)
-            # The model is shown the square canvas, not the original image, so
-            # the prompt states the canvas as the pixel frame -- the same frame
-            # the pixel-length ground truth is rescaled to below.
+            # Image and mask share one size (mismatched pairs were excluded
+            # above); prompts state it as the pixel frame, as in biometry.
+            image_width, image_height = _encoded_image_size(source['img_data'])
             computed = {
-                'image_width_pixels': CANVAS_SIZE,
-                'image_height_pixels': CANVAS_SIZE,
+                'image_width_pixels': image_width,
+                'image_height_pixels': image_height,
             }
             row_wrapper = _fill_row_placeholders(
-                load_prompt_file('mask_visual_features.txt'), source, computed)
+                load_prompt_file(
+                    'mask_visual_features.txt' if include_mask
+                    else 'image_only_visual_features.txt'),
+                source, computed)
             for feature in measurement_features:
                 feature_question = row_wrapper.format(
                     anatomy=anatomy,
@@ -835,13 +843,13 @@ class SonoReasonDD(ImageBaseDataset):
                     feature_prompt=_fill_row_placeholders(
                         prompts[feature], source, computed),
                 )
-                truth = {}
-                for target_name, column in MASK_MEASUREMENT_COLUMNS[feature].items():
-                    value = _json_scalar(source.get(column))
-                    if value is not None:
-                        truth[target_name] = (
-                            value * canvas_scale
-                            if target_name in PIXEL_LENGTH_MEASUREMENTS else value)
+                # Ground truth stays in original-image pixels, the frame the
+                # prompt states and the images are shown in.
+                truth = {
+                    target_name: _json_scalar(source.get(column))
+                    for target_name, column in MASK_MEASUREMENT_COLUMNS[feature].items()
+                    if _json_scalar(source.get(column)) is not None
+                }
                 row = {
                     'index': f'{source_index}__{feature}',
                     'source_index': source_index,
@@ -857,7 +865,8 @@ class SonoReasonDD(ImageBaseDataset):
                     # pandas materialize a NumPy array, for which pd.isna(x)
                     # has an ambiguous truth value during base initialization.
                     'image': (
-                        repr([canvas_image, canvas_mask])
+                        (repr([source['img_data'], source['mask']])
+                         if include_mask else source['img_data'])
                         if feature == 'shape' else primary_image_index),
                     # Every feature row refers to the same source image-mask
                     # pair.  Stable shared paths let dump_image decode that
@@ -865,21 +874,23 @@ class SonoReasonDD(ImageBaseDataset):
                     'image_path': repr([
                         f'{source_index}__image.png',
                         f'{source_index}__mask.png',
-                    ]),
+                    ]) if include_mask else f'{source_index}__image.png',
                     'question': feature_question,
                     'answer': '',
                     'ground_truth_measurements': json.dumps(truth),
-                    'canvas_scale': canvas_scale,
                     'ground_truth_thresholds': '{}',
                 }
                 rows.append(row)
         return pd.DataFrame(rows)
 
-    def _build_biometry_visual_data(self, data):
+    def _build_biometry_visual_data(self, data, use_overlay=True):
+        """Build biometry measurement rows shown the overlay, or with
+        use_overlay=False (biometry_image_only_features) the original image."""
         wrapper_path = os.environ.get(
             'SONOREASON_BIOMETRY_WRAPPER_PROMPT_FILE',
             str(Path(__file__).resolve().parents[3] / 'experiments' / 'prompts'
-                / 'biometry_visual_measurements_overlay.txt'),
+                / ('biometry_visual_measurements_overlay.txt' if use_overlay
+                   else 'biometry_visual_measurements_image_only.txt')),
         )
         wrapper = Path(wrapper_path).read_text(encoding='utf-8').strip()
         try:
@@ -934,16 +945,23 @@ class SonoReasonDD(ImageBaseDataset):
             raise ValueError(
                 'biometry_visual_features requires anatomy column '
                 f'{anatomy_column!r}; set biometry_anatomy_column if needed')
-        configured_overlay = os.environ.get(
-            'SONOREASON_BIOMETRY_OVERLAY_COLUMN', '').strip()
-        candidates = ([configured_overlay] if configured_overlay else []) + [
-            BIOMETRY_DEFAULT_OVERLAY_COLUMN, 'overlay_data', 'overlay_image', 'img_overlay']
-        overlay_column = next(
-            (column for column in candidates if column in data.columns), None)
-        if overlay_column is None:
-            raise ValueError(
-                'biometry_visual_features requires an embedded overlay image. '
-                f'Tried columns: {candidates}; set biometry_overlay_column if needed.')
+        if use_overlay:
+            configured_overlay = os.environ.get(
+                'SONOREASON_BIOMETRY_OVERLAY_COLUMN', '').strip()
+            candidates = ([configured_overlay] if configured_overlay else []) + [
+                BIOMETRY_DEFAULT_OVERLAY_COLUMN, 'overlay_data', 'overlay_image',
+                'img_overlay']
+            overlay_column = next(
+                (column for column in candidates if column in data.columns), None)
+            if overlay_column is None:
+                raise ValueError(
+                    'biometry_visual_features requires an embedded overlay image. '
+                    f'Tried columns: {candidates}; set biometry_overlay_column if needed.')
+        else:
+            overlay_column = 'img_data'
+            if overlay_column not in data.columns:
+                raise ValueError(
+                    'biometry_image_only_features requires the img_data column')
 
         id_column = next((column for column in (
             'patient_id', 'sample_id', 'image_id', 'filename')
@@ -968,7 +986,7 @@ class SonoReasonDD(ImageBaseDataset):
             overlay = source[overlay_column]
             if pd.isna(overlay) or not str(overlay).strip():
                 raise ValueError(
-                    f'Empty overlay image at source row {source_index}, '
+                    f'Empty image at source row {source_index}, '
                     f'column {overlay_column!r}')
             # Size of the image the model is actually shown, so prompts can
             # state the pixel frame the measurements are reported in.
@@ -1008,7 +1026,9 @@ class SonoReasonDD(ImageBaseDataset):
                     'biometry_target': str(target),
                     'feature': feature,
                     'image': overlay,
-                    'image_path': f'{source_index}__overlay.png',
+                    'image_path': (
+                        f'{source_index}__overlay.png' if use_overlay
+                        else f'{source_index}__image.png'),
                     'question': row_wrapper.format(
                         anatomy=anatomy.replace('_', ' '),
                         biometry_target=str(target),
@@ -1050,8 +1070,14 @@ class SonoReasonDD(ImageBaseDataset):
             return self._apply_sample_limit(self._build_segmentation_data(df))
         if strategy == 'mask_visual_features':
             return self._apply_sample_limit(self._build_mask_measurement_data(df))
+        if strategy == 'image_only_visual_features':
+            return self._apply_sample_limit(
+                self._build_mask_measurement_data(df, include_mask=False))
         if strategy == 'biometry_visual_features':
             return self._apply_sample_limit(self._build_biometry_visual_data(df))
+        if strategy == 'biometry_image_only_features':
+            return self._apply_sample_limit(
+                self._build_biometry_visual_data(df, use_overlay=False))
         if strategy in {'feature', 'mask_plus_features'}:
             return self._apply_sample_limit(self._build_feature_data(
                 df,
@@ -1173,7 +1199,14 @@ class SonoReasonDD(ImageBaseDataset):
 
     @staticmethod
     def _parse_feature_prediction(value):
-        text = str(value).strip()
+        # A closed Gemma thought channel (MedGemma with thinking on) is dropped;
+        # an unclosed one leaves no answer (see strip_thinking).
+        text = strip_thinking(str(value)).strip()
+        # Models that reason before answering (e.g. MedGemma-27B) can write braces
+        # or a draft object ahead of their final ```json block; parse that block.
+        fence = text.rfind('```json')
+        if fence >= 0:
+            text = text[fence + len('```json'):]
         # Reasoning-tuned models such as MedVLM-R1 may wrap the requested JSON
         # in <think>/<answer> tags. Parse only the outermost JSON object when
         # one is present, while preserving json_repair for malformed JSON.
@@ -1189,7 +1222,8 @@ class SonoReasonDD(ImageBaseDataset):
 
     def _evaluate_features(self, data, eval_file):
         measurement_only_strategies = {
-            'mask_visual_features', 'biometry_visual_features'}
+            'mask_visual_features', 'image_only_visual_features',
+            'biometry_visual_features', 'biometry_image_only_features'}
         expects_feature_label = canonical_strategy() not in measurement_only_strategies
         expects_diagnosis = canonical_strategy() not in measurement_only_strategies
         parsed_labels = []
