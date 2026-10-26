@@ -2652,6 +2652,9 @@ supported_VLM = {
 # fits the shared 768-token budget and decoding matches the other models.
 'Qwen3.8-27B': partial(vlm.MistralSmall, model_path='Qwen/Qwen3.8-27B',
                       chat_template_kwargs={'enable_thinking': False}),
+# Ultrasound VLM built on Qwen3.5-9B; its chat template thinks unless told not to.
+'EchoVLM-2.0': partial(vlm.MistralSmall, model_path='chaoyinshe/EchoVLM_2.0',
+                      chat_template_kwargs={'enable_thinking': False}),
 'LLaVA-Med-v1.5-Mistral-7B': partial(vlm.LLaVAMed, model_path='chaoyinshe/llava-med-v1.5-mistral-7b-hf'),
 'HuatuoGPT-Vision-7B': partial(
     vlm.HuatuoGPTVision,
